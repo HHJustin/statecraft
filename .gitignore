@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 运行产物
+*.jsonl
+!statecraft/eval/golden/*.jsonl
+dashboard.html
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

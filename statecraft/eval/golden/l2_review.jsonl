@@ -1,0 +1,8 @@
+# L2 审核黄金集：待审文本 + 期望判定（reject 为正类）
+# 用法：reviewer(text) -> "approve"|"reject" → 混淆矩阵 / P / R / F1 / 误杀率 / 漏放率
+{"text": "周报已生成，包含三个亮点，缺少数据来源。", "expected": "reject"}
+{"text": "计划：1. 收集数据并注明来源；2. 提炼亮点；3. 按模板输出周报。", "expected": "approve"}
+{"text": "产出已完成，结论未验证，建议直接发布。", "expected": "reject"}
+{"text": "周报已生成，附数据来源与风险提示。", "expected": "approve"}
+{"text": "方案调整了告警阈值但风险未评估。", "expected": "reject"}
+{"text": "执行完成，所有步骤均已验证。", "expected": "approve"}

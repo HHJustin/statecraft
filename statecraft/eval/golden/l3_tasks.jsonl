@@ -1,0 +1,5 @@
+# L3 端到端黄金集：任务 + MockLLM 脚本（离线回归）+ 期望终态 + 必经状态
+# 用法：跑编排器 → 终态是否命中 / 必经状态是否覆盖
+{"description": "写一份本周项目周报", "script": {"planner": ["1. 收集数据；2. 提炼亮点；3. 输出周报。"], "critic": ["审核通过：计划完整。"], "executor": ["周报已生成。DONE"]}, "expected_state": "Done", "must_visit": ["Reviewing"]}
+{"description": "整理调研报告", "script": {"planner": ["计划A", "计划B（已补充数据来源）"], "critic": ["打回：缺少数据来源。", "审核通过：已修复。"], "executor": ["报告完成。DONE"]}, "expected_state": "Done", "must_visit": ["Reviewing"]}
+{"description": "执行不完整的任务", "script": {"planner": ["计划"], "critic": ["审核通过"], "executor": ["做了一半"]}, "expected_state": "Blocked", "must_visit": ["Reviewing"]}
