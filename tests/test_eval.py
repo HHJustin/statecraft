@@ -32,10 +32,17 @@ class TestMetrics(unittest.TestCase):
 
 
 class TestRunners(unittest.TestCase):
-    def test_l1_golden_all_retrieved(self):
+    def test_l1_lexical_has_paraphrase_gap(self):
         r = run_l1()
-        self.assertEqual(r["cases"], 3)
-        self.assertEqual(r["recall_at_k"], 1.0)   # 种子集应全召回
+        self.assertEqual(r["cases"], 5)
+        # 改述样本（数据库 vs DB、生产环境 vs 线上）暴露纯词面检索的盲区
+        self.assertLess(r["recall_at_k"], 1.0)
+        self.assertGreaterEqual(r["recall_at_k"], 0.6)   # 常规样本仍应全中
+
+    def test_l1_hybrid_fixes_paraphrase(self):
+        from statecraft.eval.runner import hybrid_memory_maker
+        r = run_l1(memory_maker=hybrid_memory_maker)
+        self.assertEqual(r["recall_at_k"], 1.0)          # dense+词面补齐改述召回
         self.assertGreaterEqual(r["mrr"], 0.5)
 
     def test_l2_rule_reviewer_perfect(self):

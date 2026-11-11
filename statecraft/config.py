@@ -32,3 +32,9 @@ class AgentCoreConfig:
 
     # 委派防死锁（源自 Edict 决策八）：委派链深度上限，超限拒绝
     max_delegation_depth: int = 3
+
+    # 意图识别 / 分拣节点（源自 Edict「太子分拣」）：
+    # True = create_task 时先分拣，闲聊直接 Done 不进流水线
+    # triage_classifier 可注入 TriageBase 自定义实现（LLM 分拣等）
+    triage_enabled: bool = True
+    triage_classifier: object = None

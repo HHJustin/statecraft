@@ -23,9 +23,21 @@ from statecraft.config import AgentCoreConfig
 from statecraft.core.orchestrator import Orchestrator
 from statecraft.core.runner import Agent
 from statecraft.core.tools import AGENT_POLICY, Tool, ToolRegistry
-from statecraft.memory.local import InMemoryMemory
+from statecraft.memory.embedding import HashEmbedding
+from statecraft.memory.hybrid import HybridMemory
 from statecraft.providers.base import LLMReply, ToolCall
 from statecraft.providers.mock import MockLLM
+
+# ---- RAG 知识库：术语表 + 注释风格规范（检索增强，writer 写注释前先查）----
+# 这是 codedoc 从「演示级」到「产品级」的分水岭：注释质量取决于检索到的规范质量
+KNOWLEDGE_BASE = [
+    ("注释规范：docstring 必须说明参数语义、副作用与异常行为（如抛出的 ValueError）。",
+     {"type": "style", "source": "注释规范 v2"}),
+    ("注释规范：禁止笼统表述（如只写'计算折扣'），必须写清触发条件与边界。",
+     {"type": "style", "source": "注释规范 v2"}),
+    ("术语约定：折扣指会员折扣，level='vip' 打八折；满减指满 1000 减 100。",
+     {"type": "terminology", "source": "业务术语表"}),
+]
 
 # ---- 角色权限：谁可以读代码、谁可以写注释（命令级白名单）----
 AGENT_POLICY["doc_planner"] = {"role": "coordination",
@@ -143,13 +155,28 @@ async def main():
                           system_prompt="你是注释写手：按计划用 edit_file 写 docstring，"
                                         "写完输出 REQUEST_REVIEW 等待审查。"),
     }
-    orch = Orchestrator(agents, InMemoryMemory(),
-                        AgentCoreConfig(auto_confirm=True))
+
+    # ---- RAG：知识库入混合记忆，写注释前先检索规范（检索增强生成）----
+    mem = HybridMemory(embedder=HashEmbedding(synonyms={
+        "注释": ["docstring"], "docstring": ["注释"],
+        "异常": ["抛出", "报错"], "折扣": ["会员"],
+    }))
+    for text, meta in KNOWLEDGE_BASE:
+        mem.add(text, scope="shared", metadata=meta)
+    rag_hits = mem.search("docstring 注释规范 术语约定", limit=3, explain=True)
+    knowledge_text = "\n".join(f"- {h.text}" for h in rag_hits)
+
+    orch = Orchestrator(agents, mem, AgentCoreConfig(auto_confirm=True))
 
     before = _WORK.read_text(encoding="utf-8")
     print("=" * 60)
     print("[codedoc] 多 Agent 注释流水线启动，靶子文件：", _WORK.name)
-    task = orch.create_task(f"为代码文件 {_WORK} 补充 docstring")
+    print("[codedoc] RAG 检索到的规范条目（注入 writer 上下文）:")
+    for h in rag_hits:
+        src = (h.score_details or {}).get("lexical"), (h.score_details or {}).get("dense")
+        print(f"    - [{src[0]:.2f}/{src[1]:.2f}] {h.text[:44]}...")
+    task = orch.create_task(f"为代码文件 {_WORK} 补充 docstring。\n"
+                            f"[项目注释规范（必须遵循）]\n{knowledge_text}")
     result = await orch.run(task)
 
     after = _WORK.read_text(encoding="utf-8")

@@ -37,6 +37,7 @@ python -m unittest tests.test_codedoc -v
 
 | 场景需求 | Statecraft 机制 |
 |---|---|
+| 注释质量取决于项目规范/术语，不能让 writer 裸写 | **RAG**：术语表+注释规范入 `HybridMemory`，写前检索注入上下文（dense+词面双路） |
 | 注释写入是文件副作用，必须可撤销 | Tool.undo + SagaLog 逆序补偿 |
 | 坏注释不能直接进主干，先审再收尾 | 执行后审核（Executing→Reviewing 边 + REQUEST_REVIEW 标记） |
 | writer 不能改逻辑、只能写注释 | 命令级权限白名单（commenter 角色只有 edit_file） |

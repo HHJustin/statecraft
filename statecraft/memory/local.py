@@ -35,6 +35,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _cosine_tokens(qt: Counter, tt: Counter) -> float:
+    """词面余弦（词袋重叠），供 InMemoryMemory / HybridMemory 共用。"""
+    common = set(qt) & set(tt)
+    if not common:
+        return 0.0
+    dot = sum(qt[w] * tt[w] for w in common)
+    denom = math.sqrt(sum(qt.values()) * sum(tt.values())) or 1.0
+    return dot / denom
+
+
 class InMemoryMemory(MemoryBase):
     SIMILARITY_THRESHOLD = 0.05   # 阈值前置：语义分不过线直接淘汰
 
@@ -65,17 +75,11 @@ class InMemoryMemory(MemoryBase):
         for it in self._items.values():
             if it["deleted"]:
                 continue
-            tt = Counter(_tokens(it["text"]))
-            common = set(qt) & set(tt)
-            score = 0.0
-            if common:
-                dot = sum(qt[w] * tt[w] for w in common)
-                denom = math.sqrt(sum(qt.values()) * sum(tt.values())) or 1.0
-                score = dot / denom
+            score = _cosine_tokens(qt, Counter(_tokens(it["text"])))
             if score < self.SIMILARITY_THRESHOLD:
                 continue                          # 一票否决，不被其他信号救回
             details = ({"score": round(score, 4),
-                        "matched_terms": sorted(common)}
+                        "matched_terms": sorted(set(qt) & set(Counter(_tokens(it["text"]))))}
                        if explain else {})
             results.append(MemoryItem(it["id"], it["text"], it["scope"],
                                       it["task_id"], score, details))

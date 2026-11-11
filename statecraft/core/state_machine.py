@@ -19,7 +19,8 @@ class TaskStalled(Exception):
 
 # ---- 白名单：只允许这些跳转（单向递进，不可绕过）----
 STATE_TRANSITIONS = {
-    "Created":        {"Planning", "Cancelled"},
+    # Done = 分拣直通：意图识别判定闲聊，不进流水线（Created → Done）
+    "Created":        {"Planning", "Cancelled", "Done"},
     "Planning":       {"Reviewing", "Blocked", "Cancelled"},
     "Reviewing":      {"Executing", "Planning", "Done", "Blocked", "Cancelled"},  # Planning=打回；Done=执行后审核通过
     "Executing":      {"Done", "Reviewing", "Blocked", "Cancelled"},
@@ -59,6 +60,8 @@ class Task:
     pending_source: str | None = None  # 进入确认前的来源态（reject 回退用）
     blocked_reason: str | None = None
     parent_id: str | None = None       # 委派来源（None = 根任务）
+    intent: str | None = None          # 意图识别结果（task / chitchat，None=未分拣）
+    intent_reason: str | None = None   # 分拣依据（可观测）
     flow_log: list = field(default_factory=list)      # 状态流转日志（可观测）
     progress_log: list = field(default_factory=list)  # Agent 强制上报的进展
 
@@ -78,11 +81,13 @@ class Task:
         self.state = state
 
 
-def transition(task: Task, to: str, *, confirm: bool = False) -> Task:
+def transition(task: Task, to: str, *, confirm: bool = False,
+               reason: str = "transition") -> Task:
     """唯一合法的状态变更入口。
 
     高风险流转未确认时，不直接执行：先入 PendingConfirm，
     由 approve()/reject() 完成二次确认。
+    reason 可携带流转动机（如 triage_chitchat），进 flow_log 可观测。
     """
     if not can_transition(task.state, to):
         raise TransitionDenied(f"非法状态流转 {task.state} -> {to}（白名单外）")
@@ -91,7 +96,7 @@ def transition(task: Task, to: str, *, confirm: bool = False) -> Task:
         task.pending_target = to
         task._set("PendingConfirm", f"high-risk:{to}")
         return task
-    task._set(to, "transition")
+    task._set(to, reason)
     task.pending_target = None
     task.pending_source = None
     return task

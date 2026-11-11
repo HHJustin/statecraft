@@ -1,7 +1,8 @@
 """编排器：状态机 + 审核关卡 + 调度可靠性三件套 + 记忆注入。
 
 循环骨架（对应路线图第 8 节最小内核）：
-    查状态 → 唤醒 STATE_AGENT_MAP 对应 Agent → 记忆注入
+    意图识别（分拣：闲聊 → Created 直通 Done，不进流水线）
+    → 查状态 → 唤醒 STATE_AGENT_MAP 对应 Agent → 记忆注入
     → snapshot() → run_with_retry（wait_for 超时 + 退避重试）
     → TaskStalled → escalate()（逐级退回，到顶 Blocked）
     → 记忆沉淀 → decide_next → transition（白名单校验）
@@ -22,6 +23,7 @@ from .security import scan_injection, wrap_untrusted
 from .state_machine import (STATE_AGENT_MAP, Task, TaskStalled, approve,
                             escalate, transition)
 from .runner import Agent
+from .triage import RuleTriage
 
 _DONE_MARK = "DONE"
 _REJECT_MARKS = ("打回", "REJECT")
@@ -42,6 +44,7 @@ class Orchestrator:
         self.saga = saga or SagaLog()             # P6：工具副作用记账 + 逆序补偿
         self.delegations = delegations or DelegationTracker(
             max_depth=self.config.max_delegation_depth)   # 委派关系账本
+        self.triage = self.config.triage_classifier or RuleTriage()  # 意图识别（可插拔）
         self._seq = 0
         self._flow_idx: dict = {}   # 已投递的 flow_log 进度（按任务）
         self._prog_idx: dict = {}
@@ -51,6 +54,16 @@ class Orchestrator:
         """创建任务；parent 不为空时走委派（深度/成环闸门拒绝则抛 DelegationDenied）。"""
         self._seq += 1
         task = Task(id=f"t{self._seq}", description=description)
+        # 意图识别 / 分拣（源自 Edict「太子分拣」）：闲聊任务不进流水线
+        if self.config.triage_enabled:
+            verdict = self.triage.classify(description)
+            task.intent = verdict["intent"]
+            task.intent_reason = verdict["reason"]
+            if self.logger:
+                self.logger.log("triage", task_id=task.id, **verdict)
+            if self.outbox:
+                self.outbox.enqueue(Event("task.triaged",
+                                          {"task_id": task.id, **verdict}))
         if parent is not None:
             self.delegations.register(parent.id, task.id)   # 闸门：超深/成环在此拒绝
             task.parent_id = parent.id
@@ -96,6 +109,14 @@ class Orchestrator:
                 pass
 
     async def run(self, task: Task) -> Task:
+        # 分拣直通：闲聊/无效输入不进流水线（Created → Done，白名单合法边）
+        if task.intent == "chitchat" and task.state == "Created":
+            transition(task, "Done", reason="triage_chitchat")
+            self._flush(task)
+            if self.logger:
+                self.logger.log("task_finished", task_id=task.id, state=task.state,
+                                intent=task.intent, reason=task.intent_reason)
+            return task
         self.memory.add(f"[任务目标] {task.description}",
                         scope="task", task_id=task.id)
         while task.state not in ("Done", "Cancelled", "Blocked"):

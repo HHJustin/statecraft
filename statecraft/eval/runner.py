@@ -24,12 +24,30 @@ def rule_reviewer(text: str) -> str:
     return "reject" if any(m in text for m in _REJECT_MARKS) else "approve"
 
 
+# ---- 混合检索的离线同义词表（配合 HashEmbedding 的伪语义）----
+_HYBRID_SYNONYMS = {
+    "数据库": ["db"],
+    "线上": ["生产环境"],
+    "连不上": ["连接超时"],
+    "发布": ["部署"],
+}
+
+
+def hybrid_memory_maker():
+    """混合检索记忆构造器（每次调用给一个全新实例，黄金集按 case 隔离）。"""
+    from statecraft.memory.embedding import HashEmbedding
+    from statecraft.memory.hybrid import HybridMemory
+    return HybridMemory(embedder=HashEmbedding(synonyms=_HYBRID_SYNONYMS))
+
+
 # ---- L1 检索质量 ----
-def run_l1(cases: list[GoldenL1] | None = None, k: int = 5) -> dict:
+def run_l1(cases: list[GoldenL1] | None = None, k: int = 5,
+           memory_maker=InMemoryMemory) -> dict:
+    """memory_maker 可插拔：InMemoryMemory（纯词面）/ hybrid_memory_maker（混合）。"""
     cases = cases if cases is not None else load_l1()
     recalls, mrrs, hits = [], [], []
     for c in cases:
-        mem = InMemoryMemory()
+        mem = memory_maker()
         for t in c.corpus:
             mem.add(t)
         ranked = [h.text for h in mem.search(c.query, limit=k)]
@@ -76,12 +94,17 @@ def run_l3(cases: list[GoldenL3] | None = None, config=None) -> dict:
 
 
 def main() -> None:
-    l1 = run_l1()
+    l1_lex = run_l1()                      # 纯词面
+    l1_dense = run_l1(memory_maker=hybrid_memory_maker)   # dense+词面混合
     l2 = run_l2()
     l3 = run_l3()
     print("=" * 62)
-    print("L1 检索质量  Recall@5=%.3f  MRR=%.3f  Hit@5=%.3f  (%d cases)"
-          % (l1["recall_at_k"], l1["mrr"], l1["hit_at_k"], l1["cases"]))
+    print("L1 检索（纯词面）    Recall@5=%.3f  MRR=%.3f  Hit@5=%.3f  (%d cases)"
+          % (l1_lex["recall_at_k"], l1_lex["mrr"], l1_lex["hit_at_k"],
+             l1_lex["cases"]))
+    print("L1 检索（混合双路）  Recall@5=%.3f  MRR=%.3f  Hit@5=%.3f  (%d cases)"
+          % (l1_dense["recall_at_k"], l1_dense["mrr"], l1_dense["hit_at_k"],
+             l1_dense["cases"]))
     print("L2 审核质量  P=%.3f  R=%.3f  F1=%.3f  误杀率=%.3f  漏放率=%.3f  (%d cases)"
           % (l2["precision"], l2["recall"], l2["f1"],
              l2["false_kill_rate"], l2["false_pass_rate"], l2["cases"]))

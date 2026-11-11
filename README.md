@@ -17,7 +17,14 @@
 - **注入检测**：轻量正则扫描，命中后隔离包装为不可信数据（P10 轻量版）
 - **命令级权限白名单**：Agent 只能调 `AGENT_POLICY` 内的工具，越权拒绝 + 审计日志
 - **记忆层 5 方法**：add/search/update/delete/history，MD5 去重 + 阈值前置打分 + 版本化
-- **Provider 工厂**：换 LLM 只改配置字符串（`mock` / `openai_compat`，支持注册第三方）
+- **意图识别 / 分拣节点**：`create_task` 先分拣闲聊与任务（源自 Edict「太子分拣」），
+  闲聊直通 Done 不进流水线；规则分拣零成本，`TriageBase` 协议可换 LLM 分拣；
+  保守策略——拿不准按任务处理（漏放代价 < 误杀代价）
+- **混合检索记忆**：`HybridMemory` = dense 向量 + 词面双路打分（`EmbeddingBase` 协议 +
+  离线 `HashEmbedding`，真实 embedding API 即插即用）；`explain` 同时给出两路分值；
+  黄金集实测改述样本 Recall 0.600 → 1.000
+- **Provider 工厂**：换 LLM / 记忆后端都只改配置字符串（`LLMFactory` / `MemoryFactory`，
+  支持注册第三方）
 - **委派 + 防死锁**：任务可委派子任务（`delegate_subtask` 工具，planner 专属）；
   `DelegationTracker` 双闸门——深度超限 / 委派给祖先成环，直接拒绝（P10）
 - **Saga 补偿**：Tool 声明 `undo` 即自动记账 `SagaLog`；打回 / 取消时逆序补偿，
@@ -25,8 +32,9 @@
 - **静态看板**：Task + 会话日志 → 单文件 HTML（任务卡片 / 流转时间线 / 告警与补偿），
   零依赖浏览器直开（P7）
 - **官方示例：codedoc** —— 用框架构建的代码注释生成与审查多 Agent 流水线：
-  planner 规划 / writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销
-- **核心零依赖，测试全离线**（MockLLM 脚本化，54 个测试秒级跑完）
+  planner 规划 / writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销；
+  **RAG 增强**——术语表与注释规范入混合记忆，writer 写注释前先检索规范注入上下文
+- **核心零依赖，测试全离线**（MockLLM 脚本化，74 个测试秒级跑完）
 
 ## 快速开始
 
@@ -81,7 +89,8 @@ statecraft/
 ├── core/          # 治理层：状态机 / 工具权限 / AgentRunner / 编排器
 │                  #         事件总线+Outbox+DLQ / Saga补偿 / 委派防死锁
 │                  #         会话日志 / 注入检测
-├── memory/        # 记忆层：5 方法协议 + 内存实现
+├── memory/        # 记忆层：5 方法协议 + 内存实现 + 混合检索（dense+词面）
+│                  #         Embedding 协议 + 哈希伪向量 + 记忆后端工厂
 ├── providers/     # Provider 底座：工厂 + mock + openai 兼容
 ├── eval/          # 黄金集评估：L1/L2/L3 跑分器 + 种子样本（JSONL）
 ├── dashboard.py   # 零依赖静态 HTML 看板
