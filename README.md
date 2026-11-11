@@ -43,7 +43,11 @@
 - **官方示例：codedoc** —— 用框架构建的代码注释生成与审查多 Agent 流水线：
   意图路由四分类 → 三路检索（规范 RAG + 符号图）→ planner 规划 /
   writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销
-- **核心零依赖，测试全离线**（MockLLM 脚本化，110 个测试秒级跑完）
+- **核心零依赖，测试全离线**（MockLLM 脚本化，122 个测试 0.33 秒跑完）
+- **真实模型已验证**（DeepSeek V3，2026-11-11）：连通 / 工具循环 / 端到端三链路通过；
+  真模型下 critic 主动打回、Saga 逆序回滚 3 个文件编辑、审产出靠 `read_file` 抓到
+  「docstring 与实现不符」的真实缺陷。该轮验证暴露并修复了 7 个缺陷（MockLLM 测不出），
+  见 `tests/test_live_regressions.py` 的 12 个回归用例
 
 ## 快速开始
 
@@ -86,6 +90,26 @@ python examples/live_smoke.py
 
 失败会给出人话诊断（401 key 无效 / 404 模型名错 / 429 限流 / 网络不可达），
 不甩裸 traceback。
+
+**实测记录（DeepSeek V3，2026-11-11）**：
+
+```
+[1/3] 连通性      1.65s  → '通了'
+[2/3] 工具循环    2.62s  真实调用 add_note 2 次
+[3/3] 端到端      9.76s  Done
+      流转 Planning → Reviewing → Planning → Reviewing → Executing → PendingConfirm → Done
+```
+
+真模型与 MockLLM 的行为差异（也是那轮修复的由来）：
+
+| 现象 | MockLLM | 真实模型 | 修复 |
+|---|---|---|---|
+| 越权工具暴露 | 不调，测不出 | critic 真的调了 `read_file` | 暴露层与执行层共用 `resolve_policy` |
+| 打回次数 | 按脚本 1 次 | 连续打回直到烧钱 | `max_rejections=2`，超限 Blocked |
+| 审核者上下文 | 脚本不依赖 | 反复说「未提供待审内容」 | 注入上一步产出 |
+| 「审核通过」去向 | 靠 DONE 标记区分 | 只说「审核通过」，回 Executing 重做 | 改由「进入 Reviewing 前的状态」决定 |
+| 契约标记大小写 | 脚本全大写 | 可能输出 `reject` / `done` | 大小写不敏感匹配 |
+| 审查者能不能核实产出 | 自述即结论 | 必须 `read_file` 才审得动 | 示例里给 review 角色只读权限 |
 
 ## 用法骨架
 

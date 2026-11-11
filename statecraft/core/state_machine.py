@@ -59,6 +59,7 @@ class Task:
     pending_target: str | None = None  # PendingConfirm 的目标态
     pending_source: str | None = None  # 进入确认前的来源态（reject 回退用）
     blocked_reason: str | None = None
+    reject_count: int = 0              # 审核打回计数（防「打回↔重规划」无限循环）
     parent_id: str | None = None       # 委派来源（None = 根任务）
     intent: str | None = None          # 意图识别结果（task / chitchat，None=未分拣）
     intent_reason: str | None = None   # 分拣依据（可观测）

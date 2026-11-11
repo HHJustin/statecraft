@@ -33,6 +33,11 @@ class AgentCoreConfig:
     # 委派防死锁（源自 Edict 决策八）：委派链深度上限，超限拒绝
     max_delegation_depth: int = 3
 
+    # 审核打回上限：超过即 Blocked 交人工。
+    # 没有上限时，critic 只要「看不到待审内容」或标准过严，就会
+    # Planning ↔ Reviewing 无限循环（真模型实测踩到过，MockLLM 测不出来）。
+    max_rejections: int = 2
+
     # 意图识别 / 分拣节点（源自 Edict「太子分拣」）：
     # True = create_task 时先分拣，闲聊直接 Done 不进流水线
     # triage_classifier 可注入 TriageBase 自定义实现（LLM 分拣等）

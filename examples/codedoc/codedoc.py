@@ -76,6 +76,10 @@ AGENT_POLICY["doc_planner"] = {"role": "coordination",
                                "tools": {"report_progress", "read_file"}}
 AGENT_POLICY["commenter"] = {"role": "execution",
                              "tools": {"report_progress", "edit_file"}}
+# 审查者必须能「只读」被审对象：只靠 executor 的自述摘要审核等于没审。
+# 真模型实测：不给 read_file，critic 只会说「无法核实实际落盘内容」然后反复打回。
+AGENT_POLICY["doc_critic"] = {"role": "review",
+                              "tools": {"report_progress", "read_file"}}
 
 # ---- 靶子文件：复制到探针目录的工作副本，源文件永不直接修改 ----
 _PROJECT_DIR = Path(__file__).resolve().parent
@@ -270,8 +274,11 @@ async def main():
         "planner": Agent("planner", llm, role="doc_planner", registry=registry,
                          system_prompt="你是注释规划者：读代码 + 符号图摘要，"
                                        "规划补注释的顺序与重点。"),
-        "critic": Agent("critic", llm, role="review", registry=registry,
-                        system_prompt="你是注释审查者：审计划的完整性，审产出注释的准确性。"),
+        "critic": Agent("critic", llm, role="doc_critic", registry=registry,
+                        system_prompt="你是注释审查者。上下文用 [审核对象｜来自 X] 标明审什么："
+                                      "来自 Planning 审计划的完整性与要点具体度（此时没有 "
+                                      "docstring 是正常的）；来自 Executing 则用 read_file "
+                                      "核对实际写入的 docstring 是否说明参数、边界与异常。"),
         "executor": Agent("executor", llm, role="commenter", registry=registry,
                           system_prompt="你是注释写手：按计划用 edit_file 写 docstring，"
                                         "写完输出 REQUEST_REVIEW 等待审查。"),

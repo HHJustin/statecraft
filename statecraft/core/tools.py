@@ -63,8 +63,20 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_policy(agent_name: str, role: str | None) -> dict | None:
+    """解析 Agent 的有效权限策略：先按 role，再回落到 agent_name。
+
+    两处必须共用同一个解析函数，否则会 fail-open：
+    - 暴露层（Agent.run：只把白名单工具的 schema 发给 LLM）
+    - 执行层（check_permission：真正执行前再校验）
+    曾经暴露层只做 `AGENT_POLICY.get(role)`，当 role 是 "review" 这类
+    「角色分类」而策略表 key 是 "critic" 时查不到 → 退化成「暴露全部工具」。
+    """
+    return AGENT_POLICY.get(role or "") or AGENT_POLICY.get(agent_name)
+
+
 def check_permission(agent_name: str, role: str, tool_name: str) -> None:
-    policy = AGENT_POLICY.get(role) or AGENT_POLICY.get(agent_name)
+    policy = resolve_policy(agent_name, role)
     allowed = policy["tools"] if policy else set()
     verdict = "OK" if tool_name in allowed else "DENIED"
     AUDIT_LOG.append({"agent": agent_name, "role": role, "tool": tool_name,

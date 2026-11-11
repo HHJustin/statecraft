@@ -7,7 +7,8 @@ import inspect
 import json
 from pathlib import Path
 
-from .tools import AGENT_POLICY, ToolRegistry, call_tool, default_registry
+from .tools import (ToolRegistry, call_tool, default_registry,
+                    resolve_policy)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "agents"
 
@@ -53,8 +54,8 @@ class Agent:
                          f"当前状态：{task.state}\n\n"
                          f"相关记忆/上下文：\n{context_text or '（无）'}")},
         ]
-        # 只把白名单内的工具暴露给 LLM
-        policy = AGENT_POLICY.get(self.role)
+        # 只把白名单内的工具暴露给 LLM（与执行层共用 resolve_policy，避免 fail-open）
+        policy = resolve_policy(self.name, self.role)
         schemas = self.registry.schemas(policy["tools"]) if policy else self.registry.schemas()
 
         for _ in range(self.max_tool_iters):
