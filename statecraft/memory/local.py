@@ -45,6 +45,23 @@ def _cosine_tokens(qt: Counter, tt: Counter) -> float:
     return dot / denom
 
 
+def _match_metadata(meta: dict, where: dict | None) -> bool:
+    """元数据前置过滤：等值匹配，值给列表时命中任一即可。
+
+    放在打分之前执行 —— 噪声条目根本不参与计算（路线图「先过滤再打分」）。
+    """
+    if not where:
+        return True
+    for key, expected in where.items():
+        actual = (meta or {}).get(key)
+        if isinstance(expected, (list, tuple, set)):
+            if actual not in expected:
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
 class InMemoryMemory(MemoryBase):
     SIMILARITY_THRESHOLD = 0.05   # 阈值前置：语义分不过线直接淘汰
 
@@ -69,12 +86,14 @@ class InMemoryMemory(MemoryBase):
         return mid
 
     # ---- 查 ----
-    def search(self, query, limit=5, explain=False) -> list[MemoryItem]:
+    def search(self, query, limit=5, explain=False, where=None) -> list[MemoryItem]:
         qt = Counter(_tokens(query))
         results: list[MemoryItem] = []
         for it in self._items.values():
             if it["deleted"]:
                 continue
+            if not _match_metadata(it.get("metadata"), where):
+                continue                          # 前置过滤：不参与打分
             score = _cosine_tokens(qt, Counter(_tokens(it["text"])))
             if score < self.SIMILARITY_THRESHOLD:
                 continue                          # 一票否决，不被其他信号救回
@@ -82,7 +101,8 @@ class InMemoryMemory(MemoryBase):
                         "matched_terms": sorted(set(qt) & set(Counter(_tokens(it["text"]))))}
                        if explain else {})
             results.append(MemoryItem(it["id"], it["text"], it["scope"],
-                                      it["task_id"], score, details))
+                                      it["task_id"], score, details,
+                                      dict(it.get("metadata") or {})))
         results.sort(key=lambda r: -r.score)
         return results[:limit]
 

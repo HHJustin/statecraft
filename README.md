@@ -18,11 +18,20 @@
 - **命令级权限白名单**：Agent 只能调 `AGENT_POLICY` 内的工具，越权拒绝 + 审计日志
 - **记忆层 5 方法**：add/search/update/delete/history，MD5 去重 + 阈值前置打分 + 版本化
 - **意图识别 / 分拣节点**：`create_task` 先分拣闲聊与任务（源自 Edict「太子分拣」），
-  闲聊直通 Done 不进流水线；规则分拣零成本，`TriageBase` 协议可换 LLM 分拣；
-  保守策略——拿不准按任务处理（漏放代价 < 误杀代价）
-- **混合检索记忆**：`HybridMemory` = dense 向量 + 词面双路打分（`EmbeddingBase` 协议 +
-  离线 `HashEmbedding`，真实 embedding API 即插即用）；`explain` 同时给出两路分值；
-  黄金集实测改述样本 Recall 0.600 → 1.000
+  闲聊直通 Done 不进流水线。两级实现：`RuleTriage` 二分类（框架默认）；
+  `IntentRouter` 多分类路由（`doc`/`review`/`explain`/`chitchat`）——
+  **规则关键词打分定路由，灰区才交 LLM 兜底（可插槽，异常即降级）**，
+  返回 `level=rule|llm|fallback` 与 `confidence` 便于统计规则覆盖率
+- **三路混合检索记忆**：`HybridMemory` = dense 向量 + 词面 + **代码符号图**
+  （`EmbeddingBase` / `SymbolIndex` 双协议，离线 `HashEmbedding` 零依赖）；
+  `explain` 同时给出三路分值 + `query_symbols`；
+  黄金集实测改述样本 Recall 0.600 → 1.000（第二路），
+  关系型查询第三路从 0 召回 → 子函数全召回（`tests/test_codegraph.py`）
+- **代码符号图**：`CodeGraph` 用标准库 `ast` 抽函数/类/参数/docstring/异常，
+  回填 caller/callee 边（零依赖、确定性，不靠 NLP 猜实体）；
+  符号文本只写「我是谁」，关系只在边上——职责分离，关系型查询只能由图回答
+- **元数据前置过滤**：`search(where={...})` 先按 metadata 过滤再打分，
+  支持单值 / 列表（命中任一）；RAG 只让规范类条目参与打分，噪声不进计算
 - **Provider 工厂**：换 LLM / 记忆后端都只改配置字符串（`LLMFactory` / `MemoryFactory`，
   支持注册第三方）
 - **委派 + 防死锁**：任务可委派子任务（`delegate_subtask` 工具，planner 专属）；
@@ -32,9 +41,9 @@
 - **静态看板**：Task + 会话日志 → 单文件 HTML（任务卡片 / 流转时间线 / 告警与补偿），
   零依赖浏览器直开（P7）
 - **官方示例：codedoc** —— 用框架构建的代码注释生成与审查多 Agent 流水线：
-  planner 规划 / writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销；
-  **RAG 增强**——术语表与注释规范入混合记忆，writer 写注释前先检索规范注入上下文
-- **核心零依赖，测试全离线**（MockLLM 脚本化，74 个测试秒级跑完）
+  意图路由四分类 → 三路检索（规范 RAG + 符号图）→ planner 规划 /
+  writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销
+- **核心零依赖，测试全离线**（MockLLM 脚本化，110 个测试秒级跑完）
 
 ## 快速开始
 
@@ -65,6 +74,19 @@ config = AgentCoreConfig(
 
 核心无第三方依赖；装了 httpx 会走异步客户端，没装自动降级 urllib。
 
+接上真模型后跑一次冒烟（连通性 → 工具循环 → 端到端三链路）：
+
+```bash
+# 环境变量方式（key 不进 shell 历史）
+export OPENAI_API_KEY=sk-...            # Windows: set OPENAI_API_KEY=sk-...
+export OPENAI_BASE_URL=https://api.deepseek.com/v1
+export OPENAI_MODEL=deepseek-chat
+python examples/live_smoke.py
+```
+
+失败会给出人话诊断（401 key 无效 / 404 模型名错 / 429 限流 / 网络不可达），
+不甩裸 traceback。
+
 ## 用法骨架
 
 ```python
@@ -89,8 +111,9 @@ statecraft/
 ├── core/          # 治理层：状态机 / 工具权限 / AgentRunner / 编排器
 │                  #         事件总线+Outbox+DLQ / Saga补偿 / 委派防死锁
 │                  #         会话日志 / 注入检测
-├── memory/        # 记忆层：5 方法协议 + 内存实现 + 混合检索（dense+词面）
-│                  #         Embedding 协议 + 哈希伪向量 + 记忆后端工厂
+├── memory/        # 记忆层：5 方法协议 + 内存实现 + 三路混合检索
+│                  #         dense（Embedding 协议）+ 词面 + 代码符号图（ast）
+│                  #         元数据前置过滤 + 记忆后端工厂
 ├── providers/     # Provider 底座：工厂 + mock + openai 兼容
 ├── eval/          # 黄金集评估：L1/L2/L3 跑分器 + 种子样本（JSONL）
 ├── dashboard.py   # 零依赖静态 HTML 看板
