@@ -7,6 +7,8 @@
     → 记忆沉淀 → decide_next → transition（白名单校验）
     → Reviewing 打回 → Planning（undo 钩子留给阶段 6 Saga）
     → Executing 产出缺 DONE → 计次重跑，超限 Blocked
+    → Executing 产出 REQUEST_REVIEW → 回 Reviewing 审产出（执行后审核，
+      供代码审查类应用：审不过 → 打回补偿，审过 → Done）
     → PendingConfirm：auto_confirm 自动过，否则等待人工
 """
 import asyncio
@@ -23,6 +25,7 @@ from .runner import Agent
 
 _DONE_MARK = "DONE"
 _REJECT_MARKS = ("打回", "REJECT")
+_REVIEW_MARK = "REQUEST_REVIEW"   # 执行后审核标记：产出先审再收尾（代码审查类应用）
 
 
 class Orchestrator:
@@ -195,10 +198,14 @@ class Orchestrator:
             if any(m in output for m in _REJECT_MARKS):
                 await self._compensate(task, "review_rejected")  # 打回 → Saga 逆序补偿
                 transition(task, "Planning")           # 白名单允许的打回路径
+            elif _DONE_MARK in output:
+                transition(task, "Done")               # 执行后审核通过 → 收尾
             else:
                 transition(task, "Executing")
         elif cur == "Executing":
-            if _DONE_MARK in output:
+            if _REVIEW_MARK in output:
+                transition(task, "Reviewing")          # 执行后审核：产出先审再收尾
+            elif _DONE_MARK in output:
                 # 高风险：先入 PendingConfirm，下一轮 auto_confirm/人工处理
                 transition(task, "Done")
             else:

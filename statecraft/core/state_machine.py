@@ -21,7 +21,7 @@ class TaskStalled(Exception):
 STATE_TRANSITIONS = {
     "Created":        {"Planning", "Cancelled"},
     "Planning":       {"Reviewing", "Blocked", "Cancelled"},
-    "Reviewing":      {"Executing", "Planning", "Blocked", "Cancelled"},  # Planning=打回
+    "Reviewing":      {"Executing", "Planning", "Done", "Blocked", "Cancelled"},  # Planning=打回；Done=执行后审核通过
     "Executing":      {"Done", "Reviewing", "Blocked", "Cancelled"},
     "PendingConfirm": {"Done", "Cancelled"},                              # 二次确认中转态
     "Blocked":        {"Planning", "Reviewing", "Executing", "Cancelled"},
@@ -36,7 +36,8 @@ ESCALATION_PATH = {"Executing": "Reviewing", "Reviewing": "Planning", "Planning"
 STATE_AGENT_MAP = {"Planning": "planner", "Reviewing": "critic", "Executing": "executor"}
 
 # 高风险流转：需二次确认（源自 Edict HIGH_RISK_TRANSITIONS）
-HIGH_RISK_TRANSITIONS = {("Executing", "Done"), ("Reviewing", "Cancelled")}
+HIGH_RISK_TRANSITIONS = {("Executing", "Done"), ("Reviewing", "Done"),
+                         ("Reviewing", "Cancelled")}
 
 
 def _now() -> str:

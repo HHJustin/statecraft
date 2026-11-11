@@ -24,7 +24,9 @@
   尽力而为 + 审计留痕（Blocked 保留现场不补偿）（P6）
 - **静态看板**：Task + 会话日志 → 单文件 HTML（任务卡片 / 流转时间线 / 告警与补偿），
   零依赖浏览器直开（P7）
-- **核心零依赖，测试全离线**（MockLLM 脚本化，53 个测试 0.25s 跑完）
+- **官方示例：codedoc** —— 用框架构建的代码注释生成与审查多 Agent 流水线：
+  planner 规划 / writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销
+- **核心零依赖，测试全离线**（MockLLM 脚本化，54 个测试秒级跑完）
 
 ## 快速开始
 
@@ -32,10 +34,11 @@
 # 跑测试（离线）
 python -m unittest discover -s tests -v
 
-# 最小闭环演示 / 事件驱动演示 / 委派+补偿+看板演示
+# 最小闭环演示 / 事件驱动演示 / 委派+补偿+看板演示 / 代码注释 Agent
 python demo.py
 python demo_events.py
 python demo_dashboard.py   # 生成 dashboard_demo.html
+PYTHONPATH=. python examples/codedoc/codedoc.py
 
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
