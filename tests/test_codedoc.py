@@ -66,7 +66,7 @@ class TestCodeDocPipeline(unittest.IsolatedAsyncioTestCase):
             # 3. Saga：坏注释在打回时被回滚（2 条补偿，成功）
             rejected = [r for r in orch.saga.history
                         if r["reason"] == "review_rejected"]
-            self.assertEqual(len(rejected), 2)
+            self.assertEqual(len(rejected), 3)   # 三个函数各写一次，打回时全部回滚
             self.assertTrue(all(r["status"] == "ok" for r in rejected))
             # 4. 文件终态：好注释在、坏注释不在、锚点行完好
             final = work.read_text(encoding="utf-8")

@@ -45,6 +45,26 @@ python examples/code-review/review.py --file target_clean.py
 同一套靶子文件在 MockLLM 下也跑出 5/5 —— 但注意：**Mock 那 5 条是我写死的标准答案**，
 它证明流程通，不证明审查能力。审查能力只有真模型那次跑分算数。
 
+### 真实仓库代码（requests / click / flask，2026-11-13）
+
+靶子不是自造的 `target.py`，是 GitHub 上的真实代码（下载脚本见 `E:\Study\探针\fetch_code.py`）：
+
+| 文件 | 规模 | 结果 |
+|---|---|---|
+| `requests/hooks.py` @v2.31.0 | 33 行 | 4 条 low（都成立：变量语义漂移 / 模块级可变 list / 缺返回契约），1 条被 critic 推翻 |
+| `click/parser.py` @7.1.2 | 428 行 | 4 条，含 `appnd_const` 文档笔误、`parse_args` 就地消费调用方列表 |
+| `flask/sessions.py` @1.1.4 + `hooks.py` | 421 行 | 2 条真发现 + 1 条清白声明；`Vary: Cookie` 漏加是 Flask 2.x 真实修过的缺陷 |
+
+这轮实测暴露并修掉两个致命缺陷（详见 `docs/真实代码实测报告.md`）：
+
+1. **428 行文件 → Blocked**：`max_tool_iters=4` 装不下 15 条 finding，轮次耗尽连总结都
+   没机会输出；编排器按"有没有 REQUEST_REVIEW"判失败 → 重跑 → Blocked，产出全废。
+   修法：轮次耗尽补一次「不许调工具只输出结论」的收尾轮 + 用 `agent.mutations`
+   （有副作用工具成功执行次数）判断"确实干了活"。
+2. **388 行报 0 条却 Done**：reviewer 保守到一条不报，critic 也没有"该报的报了吗"的视
+   角，形成双盲通过。修法：内核加 `completion_check` 扩展点，应用注册"每个文件必须
+   有结论"；配套 `declare_clean`（清白声明）与 `review_status`（critic 查覆盖缺口）。
+
 ---
 
 ## 三个设计决定
@@ -130,3 +150,4 @@ python examples/code-review/review.py --file target_clean.py
 - **抽查不是全量复核**：critic 只核对 1-2 条，剩下的靠形式审兜底。
 - **行号整行匹配**：不精确到列，也不支持多行区间。
 - **结果只进内存**：`ReviewSession` 不落库，进程结束即丢（P12 要解决的事）。
+- **跨行重复未根治**：去重键是「文件+行」，同一处缺陷写在连续两行（如 `hooks = hooks or {}` / `hooks = hooks.get(key)`）会报两条，目前靠 critic 推翻一条。

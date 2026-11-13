@@ -265,5 +265,59 @@ class TestPipeline(unittest.IsolatedAsyncioTestCase):
                         "meta-review 应当至少抽查确认一条")
 
 
+class TestCoverageGate(unittest.IsolatedAsyncioTestCase):
+    """零产出不许静默通过：真机实测里 388 行 Flask 代码报了 0 条，双盲通过。"""
+
+    def test_declare_clean_requires_read_and_reason(self):
+        from statecraft.providers.base import LLMReply  # noqa: F401  （保持依赖显式）
+
+        s = _session(("target_clean.py",))
+        ctx = _ctx()
+        r1 = _call(s, ctx, "declare_clean", file="target_clean.py",
+                   reason="看过了没什么问题")
+        self.assertIn("未读", r1, "没读过就判无问题必须拒绝")
+        s.read("executor", "target_clean.py")
+        r2 = _call(s, ctx, "declare_clean", file="target_clean.py", reason="没问题")
+        self.assertIn("空泛", r2, "依据太空泛必须驳回")
+        r3 = _call(s, ctx, "declare_clean", file="target_clean.py",
+                   reason="逐个函数检查边界条件、异常处理、命名语义、资源释放、默认参数五类，未发现缺陷")
+        self.assertIn("已记录", r3)
+        self.assertEqual(s.unaccounted(), [])
+        self.assertIn("清白声明", s.report())
+
+    def test_unaccounted_counts_only_effective_findings(self):
+        """被形式审驳回的 finding 不算「有结论」，该文件仍要重新给说法。"""
+        s = _session()
+        ctx = _ctx()
+        s.read("executor", "target.py")
+        _call(s, ctx, "record_finding", **dict(VALID, evidence="这行源码里根本没有"))
+        self.assertEqual(s.rejected() and True, True)
+        self.assertEqual(s.unaccounted(), ["target.py"])
+        _call(s, ctx, "record_finding", **VALID)
+        self.assertEqual(s.unaccounted(), [])
+
+    async def test_zero_findings_blocks_instead_of_silent_done(self):
+        """读完就说「没问题」但没有任何结论记录 → Blocked，而不是假 Done。"""
+        from statecraft.providers.base import LLMReply
+        from statecraft.providers.mock import MockLLM
+
+        session = F.ReviewSession(REVIEW_DIR, ["target_clean.py"])
+        llm = MockLLM(handler=lambda messages, tools: LLMReply(
+            content="看完了，没有问题。REQUEST_REVIEW"))
+        orch, session = R.build(REVIEW_DIR, llm, session)
+        task = await orch.run(orch.create_task("审查 target_clean.py"))
+        self.assertEqual(task.state, "Blocked")
+        self.assertIn("完成条件", task.blocked_reason)
+
+    async def test_clean_claim_satisfies_completion_check(self):
+        """给了清白声明 → 正常 Done，并把依据留在报告里。"""
+        session = F.ReviewSession(REVIEW_DIR, ["target_clean.py"])
+        orch, session = R.build(REVIEW_DIR, R._ScriptedBrain(session), session)
+        task = await orch.run(orch.create_task("审查 target_clean.py"))
+        self.assertEqual(task.state, "Done")
+        self.assertIn("target_clean.py", session.clean_claims)
+        self.assertIn("清白声明", session.report())
+
+
 if __name__ == "__main__":
     unittest.main()

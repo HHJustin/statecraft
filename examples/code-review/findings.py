@@ -116,6 +116,10 @@ class ReviewSession:
         self._sources: dict[str, list[str]] = {}
         self.reads: set[tuple[str, str]] = set()      # (agent, file)
         self.findings: dict[str, Finding] = {}
+        # 清白声明：确实看过、判定没问题时的举证。没有它，「一条都不报」
+        # 就无法与「根本没看」区分——真机实测审查员读完 388 行 Flask 代码
+        # 报了 0 条，审核者也照样通过，形成双盲通过（漏报比误报危险得多）。
+        self.clean_claims: dict[str, str] = {}
 
     # ---- 路径与源码 ----
     def normalize(self, path: str) -> str:
@@ -214,6 +218,29 @@ class ReviewSession:
         """哪些被要求审查的文件，审查者一次都没读过。"""
         return [f for f in self.files if not any(k == f for _, k in self.reads)]
 
+    def unaccounted(self) -> list[str]:
+        """有结论的文件之外的那些：既没有有效 finding，也没有清白声明。
+
+        「有结论」只认形式审通过的 finding——被驳回的条目不构成结论，
+        该文件仍然要重新看一遍或给出清白举证。
+        """
+        done = {f.file for f in self.findings.values() if f.form_ok}
+        return [f for f in self.files if f not in done and f not in self.clean_claims]
+
+    def declare_clean(self, agent: str, path: str, reason: str) -> str:
+        """登记「该文件已完整审查、未发现问题」，必须带具体依据。"""
+        key = self.normalize(path)
+        if key not in self.files:
+            return f"声明失败：{key} 不在本次审查范围 {self.files} 内"
+        if (agent, key) not in self.reads:
+            return f"声明失败：本会话未读过 {key}，未读即判无问题不可信，请先 read_file"
+        why = (reason or "").strip()
+        if len(why) < 10:
+            return ("声明被驳回：reason 太空泛。要写清检查了哪些函数/哪几类问题、"
+                    "为什么判定不构成缺陷（≥10 字）")
+        self.clean_claims[key] = why
+        return f"已记录 {key} 的清白声明。"
+
     def summary(self) -> str:
         ok, rej, dis = self.confirmed(), self.rejected(), self.disputed()
         head = (f"审查文件 {len(self.files)} 个｜有效 {len(ok)} 条 / "
@@ -221,6 +248,11 @@ class ReviewSession:
         miss = self.coverage()
         if miss:
             head += f"｜未覆盖: {', '.join(miss)}"
+        if self.clean_claims:
+            head += f"｜清白声明 {len(self.clean_claims)} 个"
+        gap = self.unaccounted()
+        if gap:
+            head += f"｜无结论: {', '.join(gap)}"
         return head
 
     def report(self) -> str:
@@ -236,6 +268,11 @@ class ReviewSession:
             for f in self.disputed():
                 lines.append(f"       #{f.id} {f.file}:{f.line} {f.message[:40]}")
                 lines.append(f"       复核意见: {f.critic_note or '（未给理由）'}")
+        if self.clean_claims:
+            lines.append("")
+            lines.append("-- 清白声明（审过且判定无问题，附依据）--")
+            for k, v in self.clean_claims.items():
+                lines.append(f"       {k}: {v[:90]}")
         if self.rejected():
             lines.append("")
             lines.append("-- 形式审驳回（不计入报告，用于统计审查者幻觉率）--")
@@ -274,6 +311,19 @@ def make_tools(session: ReviewSession) -> list[Tool]:
         return ("记录已被形式审驳回，这条不计入报告：" + "；".join(f.reasons) +
                 "。请修正后重新提交，或放弃这条。")
 
+    def _declare_clean(ctx: dict, file: str, reason: str, **_) -> str:
+        """申报「该文件看完了、没发现问题」，必须带具体依据。"""
+        return session.declare_clean(ctx["agent"].name, file, reason)
+
+    def _review_status(ctx: dict, **_) -> str:
+        """审核者用的覆盖查证：还差哪些文件没有结论。"""
+        gap = session.unaccounted()
+        head = session.summary()
+        if not gap:
+            return f"{head}\n所有待审文件都有结论，可以抽查 finding 了。"
+        return (f"{head}\n**尚无结论的文件：{', '.join(gap)}** —— "
+                f"这些文件既没有问题记录，也没有清白声明，产出不完整。")
+
     def _confirm_finding(ctx: dict, finding_id: str, verdict: str,
                          note: str = "", **_) -> str:
         """meta-review：critic 抽查一条 finding，给出 confirm / dispute。"""
@@ -309,7 +359,23 @@ def make_tools(session: ReviewSession) -> list[Tool]:
                   "suggestion": {"type": "string", "description": "修复建议"}},
               "required": ["file", "line", "severity", "category",
                            "message", "evidence"]},
-             _record_finding),
+             _record_finding, mutates=True),
+        Tool("declare_clean",
+             "申报某个文件已完整审查且未发现问题。每个待审文件都必须有结论："
+             "要么 record_finding，要么 declare_clean。reason 要写清检查了哪些"
+             "函数、哪几类问题、为什么判定不构成缺陷（空话会被驳回）。",
+             {"type": "object",
+              "properties": {
+                  "file": {"type": "string", "description": "文件相对路径"},
+                  "reason": {"type": "string",
+                             "description": "逐项说明检查了什么、为什么判定无问题"}},
+              "required": ["file", "reason"]},
+             _declare_clean, mutates=True),
+        Tool("review_status",
+             "查看本次审查的整体覆盖情况：已报问题、清白声明、尚无结论的文件。"
+             "审核产出前必须先调用它。",
+             {"type": "object", "properties": {}},
+             _review_status),
         Tool("confirm_finding",
              "抽复核一条 finding：自己 read_file 核对后判定 confirm 或 dispute。",
              {"type": "object",

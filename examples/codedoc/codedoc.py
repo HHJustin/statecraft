@@ -25,8 +25,13 @@
 """
 import asyncio
 import shutil
+import sys
 import uuid
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE.parent.parent) not in sys.path:      # 允许直接 python codedoc.py
+    sys.path.insert(0, str(_HERE.parent.parent))
 
 from statecraft.config import AgentCoreConfig
 from statecraft.core.orchestrator import Orchestrator
@@ -95,6 +100,8 @@ _BAD_EDITS = [
      'def calc_discount(price, level):\n    """计算折扣。"""\n'),
     ("def send_email(to, subject, body):",
      'def send_email(to, subject, body):\n    """发邮件。"""\n'),
+    ("def parse_config(raw):",
+     'def parse_config(raw):\n    """解析配置。"""\n'),
 ]
 _GOOD_EDITS = [
     ("def calc_discount(price, level):",
@@ -103,6 +110,10 @@ _GOOD_EDITS = [
     ("def send_email(to, subject, body):",
      'def send_email(to, subject, body):\n'
      '    """发送邮件；地址为空或缺少 @ 时抛 ValueError。"""\n'),
+    ("def parse_config(raw):",
+     'def parse_config(raw):\n'
+     '    """把 "k=v;k=v" 形式的配置串解析成 dict；空串返回 {}，'
+     '缺 "=" 的段抛 ValueError。"""\n'),
 ]
 
 
@@ -158,7 +169,17 @@ def make_read_file_tool() -> Tool:
 
 
 def make_llm():
-    """脚本化 LLM：驱动完整叙事（写坏 → 审出 → 回滚 → 重写 → 过审）。"""
+    """默认脚本化假模型（驱动完整叙事）；加 --live 走真实模型。"""
+    if "--live" in sys.argv:
+        import os
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not key:
+            raise SystemExit("--live 需要设置 OPENAI_API_KEY；离线演示请去掉 --live")
+        from statecraft.providers.openai_compat import OpenAICompatLLM
+        base = os.environ.get("OPENAI_BASE_URL", "https://www.apigoto.com/v1")
+        model = os.environ.get("OPENAI_MODEL", "deepseek-flash")
+        print(f"[codedoc] 真实模型: {model} @ {base}")
+        return OpenAICompatLLM(base_url=base, model=model, api_key=key)
     state = {"critic_calls": 0, "exec_round": 1}
 
     def detect_role(messages):
@@ -322,8 +343,20 @@ async def main():
     print("[codedoc] Saga 补偿审计（打回时坏注释被自动回滚）:")
     for rec in orch.saga.history:
         print(f"    - {rec['tool']} status={rec['status']} reason={rec['reason']}")
-    print("[codedoc] 好注释已生效:", '"""按会员等级' in after)
-    print("[codedoc] 坏注释已消失:", '"""计算折扣。"""' not in after)
+    # 验收口径必须用「可度量的结构事实」，不能靠对照脚本预设的那几句注释：
+    # 真实模型写的 docstring 文案永远不会等于预设文本，那种检查只会假绿。
+    import ast as _ast
+
+    def _doc_stats(text: str) -> tuple[int, int]:
+        funcs = [n for n in _ast.walk(_ast.parse(text))
+                 if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))]
+        return (sum(1 for f in funcs if _ast.get_docstring(f)), len(funcs))
+
+    b_doc, b_all = _doc_stats(before)
+    a_doc, a_all = _doc_stats(after)
+    print(f"[codedoc] docstring 覆盖率: {b_doc}/{b_all} → {a_doc}/{a_all}")
+    if "--live" not in sys.argv:      # 离线剧本才谈得上「坏注释被回滚」
+        print("[codedoc] 坏注释已消失:", '"""计算折扣。"""' not in after)
     print("=" * 72)
 
 

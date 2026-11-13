@@ -22,6 +22,10 @@ class Tool:
     handler: Callable                      # handler(ctx, **arguments) -> str
     undo: Callable | None = None           # undo(ctx, result, **arguments) -> str（同步）
                                            # 声明了 undo 的工具，执行成功后自动入 SagaLog
+    mutates: bool = False                  # 是否产生持久副作用（写库/记录结论）。
+                                           # 编排器用它区分「干完了」和「只读了一圈」：
+                                           # 执行阶段没有终止标记但有 mutates 调用，
+                                           # 说明产出真实存在，不该按「无产出」Blocked。
 
 
 def tool_schema(t: Tool) -> dict:
@@ -98,6 +102,8 @@ async def call_tool(agent, registry: ToolRegistry, name: str, arguments: dict):
     import inspect
     if inspect.isawaitable(result):
         result = await result
+    if tool.mutates:                      # 有副作用产出：本轮「确实干了活」的确定性证据
+        agent.mutations = getattr(agent, "mutations", 0) + 1
     saga = agent.ctx.get("saga")
     if tool.undo is not None and saga is not None and "task" in agent.ctx:
         saga.record(agent.ctx["task"].id, name, arguments or {},

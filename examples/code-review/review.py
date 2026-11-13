@@ -89,9 +89,11 @@ def score_against_planted(session: ReviewSession, planted: dict) -> dict:
 AGENT_POLICY["review_planner"] = {"role": "coordination",
                                   "tools": {"report_progress", "read_file"}}
 AGENT_POLICY["reviewer"] = {"role": "execution",
-                            "tools": {"report_progress", "read_file", "record_finding"}}
+                            "tools": {"report_progress", "read_file",
+                                      "record_finding", "declare_clean"}}
 AGENT_POLICY["review_critic"] = {"role": "review",
-                                 "tools": {"report_progress", "read_file", "confirm_finding"}}
+                                 "tools": {"report_progress", "read_file",
+                                           "confirm_finding", "review_status"}}
 
 # ---------------------------------------------------------------- 三段 prompt
 PLANNER_PROMPT = (
@@ -110,7 +112,10 @@ REVIEWER_PROMPT = (
     "   - 只报你确认存在的缺陷。**没有缺陷就一条都不报**，凑数编造会被形式审驳回并记录在案；\n"
     "   - **同一行只报一个最主要的问题**。不要换措辞或换类别把同一处复述多遍，\n"
     "     重复记录会被系统识别并丢弃。\n"
-    "3. 全部处理完后，输出审查摘要，每条一行，格式：`#<id> <file>:<line> <severity> <一句话>`，"
+    "3. **每个待审文件都必须有结论**：要么至少一条 record_finding，要么调用 "
+    "declare_clean 说明你检查了哪些函数、哪几类问题、为什么判定不构成缺陷。\n"
+    "   零结论的文件会被系统拦下重跑——「看完了觉得没问题」必须留下依据。\n"
+    "4. 全部处理完后，输出审查摘要，每条一行，格式：`#<id> <file>:<line> <severity> <一句话>`，"
     "然后单独一行输出 `REQUEST_REVIEW`（硬性要求，否则流程无法推进）。"
 )
 
@@ -118,7 +123,9 @@ CRITIC_PROMPT = (
     "你是审查质量复核者。上下文会用 `[审核对象｜来自 X]` 标明这一轮审什么：\n"
     "A. 来自 Planning（审计划）：只判断计划是否覆盖了全部待审文件、每个检查项是否具体。"
     "计划阶段本来就没有具体问题清单，不要因此打回。\n"
-    "B. 来自 Executing（审报告）：抽查 1-2 条 finding，自己 read_file 核对——"
+    "B. 来自 Executing（审报告）：**先调用 review_status 查覆盖**。"
+    "若仍有「尚无结论的文件」，直接打回要求补齐，不必看具体 finding——"
+    "漏审一个文件的报告不能算通过。覆盖齐了再抽查 1-2 条 finding，自己 read_file 核对——"
     "证据那几行是否真的存在、问题描述是否成立。核对后用 confirm_finding 给出 "
     "confirm 或 dispute；发现明显不符的直接 dispute。\n"
     "输出契约（二选一，只输出一种，不要解释过程）：\n"
@@ -145,10 +152,27 @@ def build(project_root: Path, llm,
         "critic": Agent("critic", llm, role="review_critic", registry=registry,
                         system_prompt=CRITIC_PROMPT),
         "executor": Agent("executor", llm, role="reviewer", registry=registry,
-                          system_prompt=REVIEWER_PROMPT),
+                          system_prompt=REVIEWER_PROMPT,
+                          # 审查是「每条问题一次工具调用」的活，4 轮装不下真实文件：
+                          # 真机实测 428 行代码要报 15 条以上，4 轮必被截断。
+                          max_tool_iters=10),
     }
+    def _complete(task) -> str | None:
+        """应用层完成条件：每个待审文件都要有结论（问题 或 清白声明）。
+
+        真机实测教训：审查员读完 388 行 Flask 代码一条没报，审核者也盖章通过，
+        系统就"成功"产出一份空报告。内核不知道什么叫"审完了"，所以由应用
+        把这个条件注册进去——缺文件就退回重跑，不许悄悄当 Done。
+        """
+        gap = session.unaccounted()
+        if gap:
+            return (f"以下文件还没有任何结论（既没有问题记录，也没有 declare_clean "
+                    f"清白声明）：{'、'.join(gap)}")
+        return None
+
     orch = Orchestrator(agents, InMemoryMemory(),
-                        AgentCoreConfig(auto_confirm=True))
+                        AgentCoreConfig(auto_confirm=True),
+                        completion_check=_complete)
     return orch, session
 
 
@@ -210,8 +234,17 @@ class _ScriptedBrain:
                         "note": f"已核对 target.py:{ok[0].line}，证据那几行确实存在"})])
             return LLMReply(content="审核通过")
         # executor
+        target = self.session.files[0]
+        if target.endswith("target_clean.py"):
+            # 干净文件：演示「零发现也要给清白依据」，否则会被完成条件拦下
+            if n == 1:
+                return LLMReply(tool_calls=[ToolCall("read_file", {"path": target})])
+            return LLMReply(tool_calls=[ToolCall("declare_clean", {
+                "file": target,
+                "reason": "逐个函数看过边界条件、异常处理、命名语义、资源释放、"
+                          "默认参数五类，未发现缺陷"})])
         if n == 1:
-            return LLMReply(tool_calls=[ToolCall("read_file", {"path": "target.py"})])
+            return LLMReply(tool_calls=[ToolCall("read_file", {"path": target})])
         if n == 2:
             return LLMReply(tool_calls=[
                 ToolCall("record_finding", {
@@ -258,16 +291,18 @@ class _ScriptedBrain:
 
 
 # ---------------------------------------------------------------- 主流程
-async def main(mock: bool = False, files: list[str] | None = None) -> None:
+async def main(mock: bool = False, files: list[str] | None = None,
+               root: str | Path | None = None) -> None:
     files = files or TARGET_FILES
-    session = ReviewSession(TARGET_DIR, files)
+    root = Path(root).resolve() if root else TARGET_DIR
+    session = ReviewSession(root, files)
     if mock:
         print("[review] 离线模式：脚本化假模型（--mock）")
         llm = _ScriptedBrain(session)
     else:
         llm = make_llm()
 
-    orch, session = build(TARGET_DIR, llm, session)
+    orch, session = build(root, llm, session)
 
     print("[review] 待审文件:", ", ".join(files))
     task = orch.create_task(
@@ -316,13 +351,15 @@ async def main(mock: bool = False, files: list[str] | None = None) -> None:
             for f in sc["extra"]:
                 print(f"    · {f.file}:{f.line} {f.severity} {f.message[:52]}")
     else:
-        print(f"  干净文件误报: {ok} 条（期望 0）")
+        print(f"  无标准答案文件：报了 {ok} 条（需人工复核，不能直接算误报）")
     print("=" * 72)
 
 
 if __name__ == "__main__":
-    _files = []
+    _files, _root = [], None
     for i, a in enumerate(sys.argv):
         if a == "--file" and i + 1 < len(sys.argv):
             _files.extend(sys.argv[i + 1].split(","))
-    asyncio.run(main(mock="--mock" in sys.argv, files=_files or None))
+        if a == "--root" and i + 1 < len(sys.argv):
+            _root = sys.argv[i + 1]
+    asyncio.run(main(mock="--mock" in sys.argv, files=_files or None, root=_root))

@@ -13,6 +13,7 @@
     → PendingConfirm：auto_confirm 自动过，否则等待人工
 """
 import asyncio
+from typing import Callable
 
 from ..config import AgentCoreConfig
 from ..memory.base import MemoryBase
@@ -45,10 +46,17 @@ class Orchestrator:
                  config: AgentCoreConfig | None = None,
                  outbox=None, logger=None,
                  saga: SagaLog | None = None,
-                 delegations: DelegationTracker | None = None):
+                 delegations: DelegationTracker | None = None,
+                 completion_check: Callable[[Task], str | None] | None = None):
         self.agents = agents
         self.memory = memory
         self.config = config or AgentCoreConfig()
+        # 应用层可注册的「完成条件」：返回 None 表示执行产出达标，
+        # 返回字符串表示还缺什么（会注入下一轮上下文并重跑本阶段）。
+        # 内核不知道业务语义，只负责「不达标就不许往下走」。
+        # 存在的理由：审查员读了一遍文件、一条都没报，审核者也说「通过」，
+        # 系统就成了双盲通过——零产出的漏报比误报危险得多（真机实测踩到）。
+        self.completion_check = completion_check
         self.outbox = outbox        # P6：可选，业务事件经发件箱投递
         self.logger = logger        # P7：可选，JSONL 会话日志
         self.saga = saga or SagaLog()             # P6：工具副作用记账 + 逆序补偿
@@ -59,6 +67,7 @@ class Orchestrator:
         self._flow_idx: dict = {}   # 已投递的 flow_log 进度（按任务）
         self._prog_idx: dict = {}
         self._last_output: dict = {}  # task_id -> (agent_name, output)：上一步产出
+        self._gap: dict = {}          # task_id -> 未满足的完成条件（注入下一轮）
 
     # ---- 入口 ----
     def create_task(self, description: str, parent: Task | None = None) -> Task:
@@ -169,6 +178,11 @@ class Orchestrator:
                          "Executing": "执行产出（已落盘，请审查实际写入的内容）"}.get(src)
                 if focus:
                     ctx_text = f"[审核对象｜来自 {src}] {focus}\n\n{ctx_text}"
+            # 上一轮因完成条件不达标被退回 → 明确告诉它缺什么（模型不会自己想起来）
+            gap_hint = self._gap.pop(task.id, "")
+            if gap_hint:
+                ctx_text = (f"[上一轮未满足的完成条件]\n{gap_hint}\n"
+                            f"先把这些补齐，再输出结论。\n\n{ctx_text}")
             # P10：注入检测 —— 命中则隔离包装为不可信数据
             inj = scan_injection(task.description + "\n" + ctx_text)
             if inj:
@@ -266,11 +280,33 @@ class Orchestrator:
             else:
                 transition(task, "Executing")          # 计划审核通过 → 进入执行
         elif cur == "Executing":
+            # 应用层完成条件优先于「有没有写终止标记」：产出齐不齐由业务判定，
+            # 模型说「我干完了」不算数。不达标就同阶段重跑（带上缺口说明），
+            # 重跑仍不达标才 Blocked —— 不能因为漏了一个文件就放行成 Done。
+            try:
+                gap = self.completion_check(task) if self.completion_check else None
+            except Exception as e:                      # 应用插件出错不许拖垮编排
+                task.blocked_reason = f"完成条件检查异常: {type(e).__name__}: {e}"
+                task._set("Blocked", "completion_check_error")
+                return
+            if gap:
+                task.retries += 1
+                if task.retries > self.config.max_retries:
+                    task.blocked_reason = f"完成条件未满足：{gap}"
+                    task._set("Blocked", "completion_check")
+                else:
+                    self._gap[task.id] = gap
+                return
             if _hits(output, (_REVIEW_MARK,)):
                 transition(task, "Reviewing")          # 执行后审核：产出先审再收尾
             elif _hits(output, (_DONE_MARK,)):
                 # 高风险：先入 PendingConfirm，下一轮 auto_confirm/人工处理
                 transition(task, "Done")
+            elif getattr(agent, "mutations", 0) > 0:
+                # 有副作用产出（finding/注释已落库），只是模型忘了写终止标记。
+                # 少一个字符串不代表活没干完：把「产出是否完整」交给审核者判断
+                # （critic 可打回），而不是内核硬判失败、把已有产出全丢掉。
+                transition(task, "Reviewing", reason="no_marker_but_mutated")
             else:
                 task.retries += 1                      # 产出质量不达标 → 重跑
                 if task.retries > self.config.max_retries:

@@ -38,11 +38,13 @@ class Agent:
         self.system_prompt = (system_prompt if system_prompt is not None
                               else load_prompt(name))
         self.max_tool_iters = max_tool_iters
+        self.mutations = 0    # 本轮 run 内的「有副作用工具调用」次数，由 call_tool 累加
         self.ctx: dict = {}   # 工具执行时的上下文（task/agent），run 时注入
 
     async def run(self, task, context_text: str = "") -> str:
         # orchestrator/saga 由编排器在 run 前挂到 agent 属性上（getattr 兜底 None，
         # 保证 Agent 脱离编排器单独使用也不报错）
+        self.mutations = 0
         self.ctx = {"task": task, "agent": self,
                     "orchestrator": getattr(self, "orchestrator", None),
                     "saga": getattr(self, "saga", None)}
@@ -81,7 +83,14 @@ class Agent:
                     result = f"工具调用失败：{type(e).__name__}: {e}"
                 messages.append({"role": "tool", "tool_call_id": f"call_{i}",
                                  "name": tc.name, "content": str(result)})
-        return "（达到工具循环上限，未给出最终输出）"
+        # 工具轮次耗尽 ≠ 任务失败。给一次「只输出结论」的收尾机会：
+        # 没有这一步，模型报完 N 条问题后连终止标记都来不及写，
+        # 编排器就会把「干完了但没写 REQUEST_REVIEW」当成产出不达标（真机踩过）。
+        messages.append({"role": "user", "content": (
+            "工具调用次数已达本轮上限。现在**不要再调用任何工具**，"
+            "直接输出最终结论（必须包含此前约定的终止标记）。")})
+        reply = await self.llm.chat(messages, tools=None)
+        return reply.content or "（达到工具循环上限，未给出最终输出）"
 
     # ---- 回滚钩子（路线图决策四，阶段 6 实现 Saga/undo 后启用）----
     async def undo(self) -> None:

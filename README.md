@@ -48,7 +48,11 @@
   `record_finding` 工具强制结构化（文件+行号+严重度+证据）→ 六条确定性形式审
   （证据逐字符核对、未读即报、行号越界、覆盖度…）→ critic 抽查复核（meta-review）。
   真机实测：埋点检出 5/5、类别 5/5、干净文件误报 0、证据编造 0
-- **核心零依赖，测试全离线**（MockLLM 脚本化，142 个测试 0.5 秒跑完）
+- **真实仓库代码实测**（requests / click / flask，非自造靶子）：报出了官方库里的
+  真实历史缺陷（`appnd_const` 文档笔误、`Vary: Cookie` 漏加），证据可逐字符核对；
+  同时暴露 2 个致命缺陷（大文件无终止标记 → Blocked、388 行报 0 条双盲通过），
+  已修 + 7 个回归用例。详见 `docs/真实代码实测报告.md`
+- **核心零依赖，测试全离线**（MockLLM 脚本化，149 个测试 0.6 秒跑完）
 - **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
   连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
   3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
@@ -67,9 +71,13 @@ python -m unittest discover -s tests -v
 python demo.py
 python demo_events.py
 python demo_dashboard.py   # 生成 dashboard_demo.html
-PYTHONPATH=. python examples/codedoc/codedoc.py      # 注释生成
+python examples/codedoc/codedoc.py                 # 注释生成（离线剧本）
+python examples/codedoc/codedoc.py --live             # 注释生成（真实模型）
 python examples/code-review/review.py --mock          # 代码审查（离线看流程）
 python examples/code-review/review.py                 # 代码审查（需 OPENAI_API_KEY）
+
+# 审任意目录的真实代码（--root 指定根，--file 逗号分隔）
+python examples/code-review/review.py --root ../some-repo --file a.py,b.py
 
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
