@@ -62,7 +62,13 @@
 - **Provider 错误分类**：429/5xx 可重试、401/404 立刻停；同样是 429，「限流」与
   「额度已用完」含义相反，按正文关键词区分。编排器把不可恢复错误降级成 Blocked，
   而不是让异常打穿主循环——否则限流一次就留下一个永远「正在跑」的批次
-- **核心零依赖，测试全离线**（MockLLM 脚本化，188 个测试 2.3 秒跑完）
+- **审查结果可问答（P13）**：`statecraft/qa/` 三层 —— 路由（规则判定，不用模型）
+  → 查询（过滤走 SQL 聚合，语义走词面 + 可选三路召回）→ 答案（强制引用编号）。
+  一条问题能不能查、怎么查、答案出处在哪，三层各自可单测。三条硬规则：
+  **聚合数字不经过模型**（SQL 算的，模型只负责复述会算错）；**引用回查 DB**
+  （模型编的 `[F7]` 会被就地标注「查无此记录」）；**空结果不调模型**
+  （没有记录直接答「没有相关结论」，成本与幻觉都是零）
+- **核心零依赖，测试全离线**（MockLLM 脚本化，221 个测试 3.2 秒跑完）
 - **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
   连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
   3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
@@ -99,6 +105,13 @@ python examples/code-review/review.py --db reviews.db --review-id ci-<commit-sha
 sqlite3 reviews.db "SELECT severity, COUNT(*) FROM findings WHERE form_ok=1 GROUP BY 1"
 sqlite3 reviews.db "SELECT file, COUNT(*) FROM findings WHERE severity='high' AND form_ok=1 GROUP BY 1"
 sqlite3 reviews.db "SELECT COUNT(*) FROM findings WHERE form_ok=0"   # 审查者幻觉率分母
+
+# 问答：查审查结果（P13）。不配 key 也能用，自动降级为确定性清单
+python examples/code-review/ask.py --db reviews.db --q "target.py 有哪些高危问题？"
+python examples/code-review/ask.py --db reviews.db            # 交互模式
+python examples/code-review/ask.py --db reviews.db --no-llm   # 纯 SQL，不调模型
+python examples/code-review/ask.py --db reviews.db --memory   # 启用三路召回
+python examples/code-review/ask.py --db reviews.db --json --q "哪个文件问题最多？"
 
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
@@ -179,6 +192,7 @@ statecraft/
 │                  #         元数据前置过滤 + 记忆后端工厂
 ├── storage/       # 持久层（P12）：SQLite schema / 连接与迁移 / ReviewStore
 │                  #         DB 是真相源，FTS5 是派生索引（可一键重建）
+├── qa/            # 问答层（P13）：规则路由 / 查询执行 / 强制引用的答案生成
 ├── providers/     # Provider 底座：工厂 + mock + openai 兼容 + 错误分类
 ├── eval/          # 黄金集评估：L1/L2/L3 跑分器 + 种子样本（JSONL）
 ├── dashboard.py   # 零依赖静态 HTML 看板
@@ -188,8 +202,10 @@ statecraft/
 
 ## 路线图后续（未实现）
 
-P13 问答接口（审查结果可问答）/ P14 增量审查（只审 diff）/ P15 CLI —— 见
-`Statecraft完善路线图.md`；L1-Code 标注集（漏报率目前无法度量）也还缺。
+P14 增量审查（只审 diff）/ P15 CLI 打包 —— 见 `Statecraft完善路线图.md`；
+L1-Code 标注集（漏报率目前无法度量）也还缺。P13 问答已完成，但它**不是 RAG**：
+没有文档解析、没有 chunker、没有真 embedding 库、没有向量库，召回用的是
+FTS5 + LIKE + 可选的 HybridMemory（HashEmbedding 伪向量）。别把它讲成 RAG 项目。
 
 分布式事件总线（Redis Streams / NATS）——当前 EventBus 是进程内队列，
 跨进程/多机部署、崩溃后事件不丢的需求出现时再上；Outbox.relay 的投递目标

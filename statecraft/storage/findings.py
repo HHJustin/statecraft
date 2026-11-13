@@ -226,7 +226,54 @@ class ReviewStore:
         args.append(limit)
         return [_row(r) for r in self.conn.execute(sql, args).fetchall()]
 
-    def counts_by_severity(self, review_id: str | None = None,
+    def files(self, review_id: str | None = None,
+              form_ok: bool | None = True) -> list[str]:
+        """本批次（或全库）出现过的文件路径。
+
+        问答层要回答「auth.py 有哪些问题」，就得先把用户嘴里的 `auth.py`
+        映射到库里真实的 `src/auth.py` —— 猜测路径前缀是错的，查一遍才对。
+        """
+        sql = "SELECT DISTINCT file FROM findings WHERE 1=1"
+        args: list = []
+        if review_id:
+            sql += " AND review_id=?"
+            args.append(review_id)
+        if form_ok is not None:
+            sql += " AND form_ok=?"
+            args.append(int(form_ok))
+        sql += " ORDER BY file"
+        return [r["file"] for r in self.conn.execute(sql, args).fetchall()]
+
+    def latest_review(self, only_finished: bool = True) -> dict | None:
+        """最新批次。结构化查询默认只查它，理由见 qa/query.py 的说明。"""
+        sql = "SELECT * FROM reviews"
+        if only_finished:
+            sql += " WHERE status IN ('done','reviewed')"
+        sql += " ORDER BY started_at DESC LIMIT 1"
+        r = self.conn.execute(sql).fetchone()
+        return self.get_review(r["id"]) if r else None
+
+    def count(self, review_id: str | None = None, *, severity: str | None = None,
+              file: str | None = None, form_ok: bool | None = True) -> int:
+        """精确计数（不用 len(list)：列表有 limit，计数不该被截断）。"""
+        sql = "SELECT COUNT(*) AS n FROM findings WHERE 1=1"
+        args: list = []
+        if review_id:
+            sql += " AND review_id=?"
+            args.append(review_id)
+        if severity:
+            sql += " AND severity=?"
+            args.append(severity)
+        if file:
+            sql += " AND file=?"
+            args.append(file)
+        if form_ok is not None:
+            sql += " AND form_ok=?"
+            args.append(int(form_ok))
+        return self.conn.execute(sql, args).fetchone()["n"]
+
+    def counts_by_severity(self, review_id: str | None = None, *,
+                           severity: str | None = None, file: str | None = None,
                            form_ok: bool | None = True) -> dict[str, int]:
         """严重度分布。
 
@@ -239,6 +286,12 @@ class ReviewStore:
         if review_id:
             sql += " AND review_id=?"
             args.append(review_id)
+        if severity:
+            sql += " AND severity=?"
+            args.append(severity)
+        if file:
+            sql += " AND file=?"
+            args.append(file)
         if form_ok is not None:
             sql += " AND form_ok=?"
             args.append(int(form_ok))
