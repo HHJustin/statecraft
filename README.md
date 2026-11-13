@@ -40,14 +40,22 @@
   尽力而为 + 审计留痕（Blocked 保留现场不补偿）（P6）
 - **静态看板**：Task + 会话日志 → 单文件 HTML（任务卡片 / 流转时间线 / 告警与补偿），
   零依赖浏览器直开（P7）
-- **官方示例：codedoc** —— 用框架构建的代码注释生成与审查多 Agent 流水线：
+- **官方示例一：codedoc** —— 代码注释生成流水线：
   意图路由四分类 → 三路检索（规范 RAG + 符号图）→ planner 规划 /
   writer 写入（Saga 可回滚）/ critic 审核，坏注释打回时自动撤销
-- **核心零依赖，测试全离线**（MockLLM 脚本化，122 个测试 0.33 秒跑完）
-- **真实模型已验证**（DeepSeek V3，2026-11-11）：连通 / 工具循环 / 端到端三链路通过；
-  真模型下 critic 主动打回、Saga 逆序回滚 3 个文件编辑、审产出靠 `read_file` 抓到
-  「docstring 与实现不符」的真实缺陷。该轮验证暴露并修复了 7 个缺陷（MockLLM 测不出），
-  见 `tests/test_live_regressions.py` 的 12 个回归用例
+- **官方示例二：code-review** —— 代码审查流水线，与 codedoc **共用同一套内核
+  （`core/` 零改动）**，只换角色 / 契约 / 工具集：
+  `record_finding` 工具强制结构化（文件+行号+严重度+证据）→ 六条确定性形式审
+  （证据逐字符核对、未读即报、行号越界、覆盖度…）→ critic 抽查复核（meta-review）。
+  真机实测：埋点检出 5/5、类别 5/5、干净文件误报 0、证据编造 0
+- **核心零依赖，测试全离线**（MockLLM 脚本化，142 个测试 0.5 秒跑完）
+- **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
+  连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
+  3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
+  第一轮验证暴露并修复 7 个缺陷（MockLLM 测不出，见
+  `tests/test_live_regressions.py` 12 个回归用例）；审查流水线又暴露 2 个
+  （去重键过松导致同缺陷复述 22 条、对照文件自身不干净），见
+  `examples/code-review/README.md`
 
 ## 快速开始
 
@@ -55,11 +63,13 @@
 # 跑测试（离线）
 python -m unittest discover -s tests -v
 
-# 最小闭环演示 / 事件驱动演示 / 委派+补偿+看板演示 / 代码注释 Agent
+# 最小闭环演示 / 事件驱动演示 / 委派+补偿+看板演示 / 两条业务流水线
 python demo.py
 python demo_events.py
 python demo_dashboard.py   # 生成 dashboard_demo.html
-PYTHONPATH=. python examples/codedoc/codedoc.py
+PYTHONPATH=. python examples/codedoc/codedoc.py      # 注释生成
+python examples/code-review/review.py --mock          # 代码审查（离线看流程）
+python examples/code-review/review.py                 # 代码审查（需 OPENAI_API_KEY）
 
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
