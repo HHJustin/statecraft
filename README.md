@@ -52,7 +52,17 @@
   真实历史缺陷（`appnd_const` 文档笔误、`Vary: Cookie` 漏加），证据可逐字符核对；
   同时暴露 2 个致命缺陷（大文件无终止标记 → Blocked、388 行报 0 条双盲通过），
   已修 + 7 个回归用例。详见 `docs/真实代码实测报告.md`
-- **核心零依赖，测试全离线**（MockLLM 脚本化，149 个测试 0.6 秒跑完）
+- **审查结果持久化（P12）**：`statecraft/storage/` 把批次 / findings / 清白声明落 SQLite
+  （标准库自带、单文件、能 SQL 聚合）。主键 `sha1(review_id|file|line)` —— 同一批次重跑
+  不会翻倍；`findings_fts` 是派生索引，增量与重建共用**同一段 SQL 表达式**，所以「重建后
+  结果一致」是可验证的而不是口头承诺。`--db` 指定库文件，`--no-db` 关掉落盘
+- **记忆可落盘**：`SqliteMemory` 实现同一套 5 方法（md5 去重 / 阈值前置 / 软删 / history
+  只增不改），`memory_backend="sqlite"` 切换即用，`MemoryFactory` 一行没改；
+  元数据过滤下推到 `json_extract`，不是「先捞全表再 Python 筛」
+- **Provider 错误分类**：429/5xx 可重试、401/404 立刻停；同样是 429，「限流」与
+  「额度已用完」含义相反，按正文关键词区分。编排器把不可恢复错误降级成 Blocked，
+  而不是让异常打穿主循环——否则限流一次就留下一个永远「正在跑」的批次
+- **核心零依赖，测试全离线**（MockLLM 脚本化，188 个测试 2.3 秒跑完）
 - **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
   连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
   3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
@@ -78,6 +88,17 @@ python examples/code-review/review.py                 # 代码审查（需 OPENA
 
 # 审任意目录的真实代码（--root 指定根，--file 逗号分隔）
 python examples/code-review/review.py --root ../some-repo --file a.py,b.py
+
+# 结果落 SQLite（默认仓库根 reviews.db；--no-db 关闭）
+python examples/code-review/review.py --mock --db reviews.db
+# CI 场景固定批次号 = 重跑覆盖同一批，同一处问题不会因为跑两遍变成两条
+python examples/code-review/review.py --db reviews.db --review-id ci-<commit-sha>
+
+# 直接查库（不需要额外工具）。注意 form_ok=1：被形式审驳回的编造条目也留档，
+# 但不算「报告里的问题」——不加这个条件，分布会把它们算进去（6 vs 5）
+sqlite3 reviews.db "SELECT severity, COUNT(*) FROM findings WHERE form_ok=1 GROUP BY 1"
+sqlite3 reviews.db "SELECT file, COUNT(*) FROM findings WHERE severity='high' AND form_ok=1 GROUP BY 1"
+sqlite3 reviews.db "SELECT COUNT(*) FROM findings WHERE form_ok=0"   # 审查者幻觉率分母
 
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
@@ -156,7 +177,9 @@ statecraft/
 ├── memory/        # 记忆层：5 方法协议 + 内存实现 + 三路混合检索
 │                  #         dense（Embedding 协议）+ 词面 + 代码符号图（ast）
 │                  #         元数据前置过滤 + 记忆后端工厂
-├── providers/     # Provider 底座：工厂 + mock + openai 兼容
+├── storage/       # 持久层（P12）：SQLite schema / 连接与迁移 / ReviewStore
+│                  #         DB 是真相源，FTS5 是派生索引（可一键重建）
+├── providers/     # Provider 底座：工厂 + mock + openai 兼容 + 错误分类
 ├── eval/          # 黄金集评估：L1/L2/L3 跑分器 + 种子样本（JSONL）
 ├── dashboard.py   # 零依赖静态 HTML 看板
 ├── agents/        # 三层 prompt：GLOBAL.md → 角色文件
@@ -164,6 +187,9 @@ statecraft/
 ```
 
 ## 路线图后续（未实现）
+
+P13 问答接口（审查结果可问答）/ P14 增量审查（只审 diff）/ P15 CLI —— 见
+`Statecraft完善路线图.md`；L1-Code 标注集（漏报率目前无法度量）也还缺。
 
 分布式事件总线（Redis Streams / NATS）——当前 EventBus 是进程内队列，
 跨进程/多机部署、崩溃后事件不丢的需求出现时再上；Outbox.relay 的投递目标

@@ -13,6 +13,8 @@
     → PendingConfirm：auto_confirm 自动过，否则等待人工
 """
 import asyncio
+
+from ..providers.base import ProviderError
 from typing import Callable
 
 from ..config import AgentCoreConfig
@@ -243,6 +245,18 @@ class Orchestrator:
                 return await asyncio.wait_for(
                     agent.run(task, ctx_text),
                     timeout=self.config.state_timeouts.get(task.state, 300.0))
+            except ProviderError as e:
+                # 限流 / 网关抖动可以重试；401、模型名写错这类重试一万次也一样，
+                # 立刻按停滞处理（走升级链到 Blocked），而不是让异常打穿主循环。
+                if self.logger:
+                    self.logger.log("provider_error", task_id=task.id,
+                                    error=str(e), status=e.status,
+                                    retryable=e.retryable)
+                if e.retryable and i < self.config.max_retries:
+                    backoff = self.config.retry_backoff
+                    await asyncio.sleep(backoff[min(i, len(backoff) - 1)])
+                else:
+                    raise TaskStalled(task.state) from None
             except asyncio.TimeoutError:
                 if i < self.config.max_retries:
                     backoff = self.config.retry_backoff

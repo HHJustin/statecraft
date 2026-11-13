@@ -67,7 +67,8 @@ class Finding:
     message: str
     evidence: str
     suggestion: str = ""
-    id: str = ""
+    id: str = ""                   # 会话内编号（8 位，报告里显示的 #xxxx）
+    db_id: str = ""                # 库内主键（16 位，含批次，跨批不会撞）
     agent: str = ""
     status: str = "proposed"      # proposed/confirmed/disputed/dismissed
     checks: dict = field(default_factory=dict)
@@ -120,6 +121,34 @@ class ReviewSession:
         # 就无法与「根本没看」区分——真机实测审查员读完 388 行 Flask 代码
         # 报了 0 条，审核者也照样通过，形成双盲通过（漏报比误报危险得多）。
         self.clean_claims: dict[str, str] = {}
+        # 持久层（可选）：绑定后每条结论都落库。不绑也能跑——审查的正确性
+        # 不依赖存储，存储只负责「事后能查」。这也是为什么 attach 是独立的
+        # 一步而不是构造参数：先跑起来，再决定存哪。
+        self.store = None
+        self.review_id: str | None = None
+        self.plan: str = ""          # 规划原文，收尾时落库（事后能复盘「为什么这么审」）
+
+    def attach(self, store, review_id: str) -> "ReviewSession":
+        """绑定 SQLite。已在内存里的结论会补写一遍，避免先记录后绑定丢数据。"""
+        self.store, self.review_id = store, review_id
+        for f in list(self.findings.values()):
+            self._persist(f)
+        for path, why in list(self.clean_claims.items()):
+            store.add_clean_claim(review_id, path, "unknown", why)
+        return self
+
+    def _persist(self, f: Finding) -> str | None:
+        """把一条 finding 写进库（幂等：同批次 文件+行 只会有一行）。"""
+        if self.store is None:
+            return None
+        f.db_id = self.store.record(
+            self.review_id, file=f.file, line=f.line, severity=f.severity,
+            category=f.category, message=f.message, evidence=f.evidence,
+            suggestion=f.suggestion, status=f.status, form_ok=f.form_ok,
+            evidence_ok=bool(f.checks.get("evidence")),
+            audit_ok=bool(f.checks.get("audit")),
+            critic_note=f.critic_note)
+        return f.db_id
 
     # ---- 路径与源码 ----
     def normalize(self, path: str) -> str:
@@ -202,6 +231,7 @@ class ReviewSession:
         if old is not None and old.form_ok:
             return old
         self.findings[fid] = f
+        self._persist(f)
         return f
 
     def confirmed(self) -> list[Finding]:
@@ -239,7 +269,19 @@ class ReviewSession:
             return ("声明被驳回：reason 太空泛。要写清检查了哪些函数/哪几类问题、"
                     "为什么判定不构成缺陷（≥10 字）")
         self.clean_claims[key] = why
+        if self.store is not None:
+            self.store.add_clean_claim(self.review_id, key, agent, why)
         return f"已记录 {key} 的清白声明。"
+
+    def confirm(self, fid: str, verdict: str, note: str = "") -> Finding | None:
+        """meta-review 结论：confirm / dispute。写内存 + 落库，两处必须同源。"""
+        f = self.findings.get(fid)
+        if f is None:
+            return None
+        f.status = "confirmed" if verdict == "confirm" else "disputed"
+        f.critic_note = note or ""
+        self._persist(f)
+        return f
 
     def summary(self) -> str:
         ok, rej, dis = self.confirmed(), self.rejected(), self.disputed()
@@ -334,8 +376,7 @@ def make_tools(session: ReviewSession) -> list[Tool]:
         v = str(verdict).lower()
         if v not in ("confirm", "dispute"):
             return "verdict 只能是 confirm 或 dispute"
-        f.status = "confirmed" if v == "confirm" else "disputed"
-        f.critic_note = note or ""
+        session.confirm(fid, v, note)
         target = "确认成立" if v == "confirm" else "判定不成立，已移除"
         return f"#{fid} {target}。{note}"
 

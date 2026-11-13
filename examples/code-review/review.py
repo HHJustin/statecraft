@@ -43,11 +43,14 @@ from statecraft.core.runner import Agent
 from statecraft.core.tools import AGENT_POLICY, ToolRegistry, default_registry
 from statecraft.memory.local import InMemoryMemory
 from statecraft.providers.base import LLMReply, ToolCall
+from statecraft.storage import DEFAULT_DB, ReviewStore
 
 from findings import ReviewSession, make_tools
 
 TARGET_DIR = _HERE
 TARGET_FILES = ["target.py"]
+# 审查结果默认落在仓库根目录（.gitignore 已忽略 *.db）
+DEFAULT_DB_PATH = _HERE.parent.parent / DEFAULT_DB
 
 # 标准答案：(文件, 行号) -> (类别, 期望严重度)。
 # 有了它「检出率」才是可算的数字，而不是「看着挺好的」。
@@ -157,6 +160,18 @@ def build(project_root: Path, llm,
                           # 真机实测 428 行代码要报 15 条以上，4 轮必被截断。
                           max_tool_iters=10),
     }
+    # 规划原文是「为什么这么审」的唯一证据，但内核不保存历史产出
+    # （_last_output 只留最后一步）。这里包一层 run 把它摘出来 —— 换的是
+    # Agent 实例的属性，不是内核代码。
+    _inner_run = agents["planner"].run
+
+    async def _capture_plan(task, context_text: str = ""):
+        out = await _inner_run(task, context_text)
+        session.plan = out or ""
+        return out
+
+    agents["planner"].run = _capture_plan
+
     def _complete(task) -> str | None:
         """应用层完成条件：每个待审文件都要有结论（问题 或 清白声明）。
 
@@ -292,7 +307,8 @@ class _ScriptedBrain:
 
 # ---------------------------------------------------------------- 主流程
 async def main(mock: bool = False, files: list[str] | None = None,
-               root: str | Path | None = None) -> None:
+               root: str | Path | None = None, db: str | None = None,
+               review_id: str | None = None) -> None:
     files = files or TARGET_FILES
     root = Path(root).resolve() if root else TARGET_DIR
     session = ReviewSession(root, files)
@@ -310,7 +326,34 @@ async def main(mock: bool = False, files: list[str] | None = None,
         f"[要求] 每条问题必须带文件、行号、严重度、类别与源文件证据；"
         f"证据需逐字符可核对。只报真实缺陷。"
     )
-    result = await orch.run(task)
+    # ---- P12：结果落库（db="" 表示本次不落库）----
+    store, pinned = None, review_id      # pinned：调用方指定的批次号，None = 新建
+    review_id = None
+    if db != "":
+        store = ReviewStore(db or DEFAULT_DB_PATH)
+        review_id = store.start_review(
+            repo_root=root, scope=files, task_id=task.id, review_id=pinned,
+            model="mock" if mock else os.environ.get("OPENAI_MODEL", ""))
+        session.attach(store, review_id)      # 之后每条结论都自动落库
+        print(f"[review] 持久化: {db or DEFAULT_DB_PATH}｜批次 {review_id}")
+
+    try:
+        result = await orch.run(task)
+    except Exception as exc:                    # noqa: BLE001
+        # 任何异常都不能让批次停在 draft —— 库里躺着一个「正在跑」的审查，
+        # 比明确失败更糟：第二天没人知道它是死是活。
+        if store is not None:
+            store.finish_review(review_id, "blocked", plan=session.plan or None)
+            print(f"\n[review] 运行中断：{type(exc).__name__}: {exc}")
+            print(f"[review] 已按 blocked 落库：批次 {review_id}｜"
+                  f"保留 findings {len(session.findings)} 条")
+        raise
+
+    if store is not None:
+        # Done 与 Blocked 都落终态：Blocked 的 findings 恰恰是最该留档的
+        store.finish_review(review_id,
+                            "done" if result.state == "Done" else "blocked",
+                            plan=session.plan or None)
 
     print("\n" + "=" * 72)
     print("[review] 最终状态:", result.state)
@@ -352,14 +395,38 @@ async def main(mock: bool = False, files: list[str] | None = None,
                 print(f"    · {f.file}:{f.line} {f.severity} {f.message[:52]}")
     else:
         print(f"  无标准答案文件：报了 {ok} 条（需人工复核，不能直接算误报）")
+
+    if store is not None:
+        rv = store.get_review(review_id)
+        print("\n[review] 已落库（P12）：")
+        print(f"  批次 {review_id}｜状态 {rv['status']}｜"
+              f"findings {rv['findings_total']} 条（确认 {rv['findings_confirmed']}"
+              f" / 推翻 {rv['findings_disputed']}）")
+        print("  严重度分布:", store.counts_by_severity(review_id))
+        dist = ", ".join(f"{r['file']}×{r['n']}" for r in store.counts_by_file(review_id))
+        print("  文件分布:", dist or "（无）")
+        hits = store.search("average", limit=3)
+        sample = (f"，例 {hits[0]['file']}:{hits[0]['line']}"
+                  f" {hits[0]['message'][:34]}" if hits else "")
+        print(f"  符号检索 'average' → {len(hits)} 条{sample}")
+        print("  清白声明:", [c["file"] for c in store.clean_claims(review_id)] or "（无）")
+        print(f"  历史批次: {len(store.list_reviews())} 条")
+        store.close()
     print("=" * 72)
 
 
 if __name__ == "__main__":
-    _files, _root = [], None
+    _files, _root, _db, _rid = [], None, None, None
+    if "--no-db" in sys.argv:
+        _db = ""                                  # 显式关掉落库
     for i, a in enumerate(sys.argv):
         if a == "--file" and i + 1 < len(sys.argv):
             _files.extend(sys.argv[i + 1].split(","))
         if a == "--root" and i + 1 < len(sys.argv):
             _root = sys.argv[i + 1]
-    asyncio.run(main(mock="--mock" in sys.argv, files=_files or None, root=_root))
+        if a == "--db" and i + 1 < len(sys.argv):
+            _db = sys.argv[i + 1]
+        if a == "--review-id" and i + 1 < len(sys.argv):
+            _rid = sys.argv[i + 1]      # 固定批次号 = 重跑覆盖而非新增
+    asyncio.run(main(mock="--mock" in sys.argv, files=_files or None,
+                     root=_root, db=_db, review_id=_rid))

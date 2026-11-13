@@ -26,6 +26,11 @@ set OPENAI_BASE_URL=https://www.apigoto.com/v1
 set OPENAI_MODEL=deepseek-flash
 python examples/code-review/review.py
 
+# 结果落 SQLite（P12；默认仓库根 reviews.db，--no-db 关闭）
+python examples/code-review/review.py --mock --db reviews.db
+# 固定批次号 = 重跑覆盖同一批（同一处问题不会因为跑两遍变成两条）
+python examples/code-review/review.py --db reviews.db --review-id ci-<sha>
+
 # 换文件（默认审 target.py；审干净文件看误报率）
 python examples/code-review/review.py --file target_clean.py
 ```
@@ -143,11 +148,60 @@ python examples/code-review/review.py --file target_clean.py
 
 ---
 
+## 落库（P12）
+
+`ReviewSession.attach(store, review_id)` 之后，每条 finding / 清白声明 / 复核结论都会
+写进 SQLite。三个设计点：
+
+| 决定 | 理由 |
+|---|---|
+| 主键 `sha1(review_id\|file\|line)[:16]` | 模型并行发多次 `tool_call` 是常态，内容哈希天然去重；message 不进哈希（换措辞就失效） |
+| 冲突时 UPDATE 而非 `INSERT OR IGNORE` | 形式审驳回后带着正确证据重新提交是正常流程，IGNORE 会让它永远停在驳回态 |
+| FTS 文本由 `SEARCH_TEXT_SQL` 生成，增量与重建共用 | 否则「重建结果一致」只是愿望 |
+
+**DB 是真相源，索引是派生视图**：`findings_fts` 坏了不修，直接
+`store.rebuild_index()` 重建（`DELETE` + 从 `findings` 重灌，与增量写共用同一段 SQL）。
+
+落库时机与终态：
+
+```
+record_finding  → INSERT ... ON CONFLICT(id) DO UPDATE（幂等）
+confirm_finding → UPDATE findings SET status='confirmed'|'disputed'
+任务 Done       → reviews.status='done'   + 统计列按 findings 重算
+任务 Blocked    → reviews.status='blocked'（保留全部 findings —— 它们最该留档）
+运行异常        → 按 blocked 落库，绝不留一个「正在跑」的批次
+```
+
+最后一条是真机踩出来的：接口额度耗尽（HTTP 429 / code 42906）时，旧代码让异常打穿
+主循环，任务既不 Done 也不 Blocked，库里就躺着一个永远 `draft` 的审查。现在 provider
+错误会分类（429/5xx 可重试、401/404 立刻停、「额度已用完」虽为 429 但不可重试），
+不可恢复时降级为 Blocked —— 实测 1.3 秒收敛，而不是白等 90 秒重试。
+
+查库举例（不需要额外工具）：
+
+```bash
+sqlite3 reviews.db "SELECT severity, COUNT(*) FROM findings WHERE form_ok=1 GROUP BY 1"
+sqlite3 reviews.db "SELECT file, COUNT(*) FROM findings WHERE severity='high' AND form_ok=1 GROUP BY 1"
+sqlite3 reviews.db "SELECT COUNT(*) FROM findings WHERE form_ok=0"   # 编造/越界被驳回的条数
+sqlite3 reviews.db "SELECT status, COUNT(*) FROM reviews GROUP BY 1"
+```
+
+`form_ok=1` 这个条件不能省：被形式审驳回的编造条目**也留在表里**（否则幻觉率没法算），
+但在报告里不算数。`store.counts_by_severity()` 默认就带这个过滤——真机第一次跑出来
+「报告 5 条、分布 6 条」就是这么来的，已修。
+
+实测（`--mock`，3 次重跑同一 `--review-id`）：始终 1 个批次 / 5 条有效 finding，
+严重度分布 `{high:3, medium:2}` 与 `findings_total=5` 对得上，
+`DROP TABLE findings_fts` 后重建，检索结果逐条一致；干净文件走 `declare_clean`
+时 `clean_claims` 落库（0 条 finding 也有结论可查）。
+
+---
+
 ## 局限（诚实清单）
 
 - **单文件、无 diff**：一次只审给定文件，不支持 git diff 增量审查。
 - **无跨文件上下文**：不知道被审函数在别处怎么被调用（符号图能力没接进来）。
 - **抽查不是全量复核**：critic 只核对 1-2 条，剩下的靠形式审兜底。
 - **行号整行匹配**：不精确到列，也不支持多行区间。
-- **结果只进内存**：`ReviewSession` 不落库，进程结束即丢（P12 要解决的事）。
+- ~~**结果只进内存**~~：P12 已解决，见下节「落库」；未落库时仍可 `--no-db` 跑。
 - **跨行重复未根治**：去重键是「文件+行」，同一处缺陷写在连续两行（如 `hooks = hooks or {}` / `hooks = hooks.get(key)`）会报两条，目前靠 critic 推翻一条。

@@ -8,6 +8,9 @@ dist/
 venv/
 
 # 运行产物
+*.db
+*.db-wal
+*.db-shm
 *.jsonl
 !statecraft/eval/golden/*.jsonl
 dashboard.html
