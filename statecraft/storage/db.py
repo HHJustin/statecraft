@@ -9,15 +9,24 @@
    WAL 是库级但也要每连接确认一次。
 2. **用 `PRAGMA user_version` 做版本号**，不额外建 migrations 表 ——
    这么小的 schema 不需要 Alembic，但必须能识别「库比代码旧/新」。
-3. **不吞异常**：库比代码新时直接抛错，而不是带着缺失的列继续跑，
-   否则错误会在几十行之外以「no such column」的形式冒出来。
+3. **只自动执行「纯新增」的迁移**：每个版本必须在 `_ADDITIVE_STEPS` 里
+   登记一句「这一步加了什么、为什么是纯新增」。没登记的版本一律拒绝，
+   因为写在半路的改列/搬数据迁移会让库停在既不是旧版也不是新版的中间态
+   —— 那种情况必须交给人，代码不许自作聪明。
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 版本 → (这一步新增了什么, 是否纯新增)。
+# 「纯新增」= 只 CREATE TABLE/INDEX IF NOT EXISTS，重跑 schema.sql 对已有
+# 数据零副作用。任何需要改列、搬数据、收紧约束的版本都不许登记成 True。
+_ADDITIVE_STEPS: dict[int, tuple[str, bool]] = {
+    2: ("unit_cache：增量审查的函数体哈希缓存（纯新增表）", True),
+}
 DEFAULT_DB = "statecraft.db"
 
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
@@ -28,14 +37,18 @@ _initialized: set[str] = set()
 
 
 def _resolve(db_path) -> str:
-    """`":memory:"` 原样返回；文件路径转绝对路径并建父目录。"""
+    """`":memory:"` 原样返回；文件路径转**规范**绝对路径并建父目录。
+
+    必须无条件 `resolve()`：Windows 的 `%TEMP%` 常是 8.3 短名
+    （`C://Users//CHENGX~1//...`），同一个文件于是有两个字符串写法。
+    用它当 `_initialized` 的键，就会出现「测试拿长名去清缓存清不掉、
+    生产里换一种写法打开就重跑一遍 DDL」这类只在特定机器上复现的问题。
+    """
     if str(db_path) == ":memory:":
         return ":memory:"
     p = Path(db_path).expanduser()
-    if not p.is_absolute():
-        p = p.resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
-    return str(p)
+    return str(p.resolve())
 
 
 def connect(db_path=DEFAULT_DB, *, init: bool = True) -> sqlite3.Connection:
@@ -53,7 +66,11 @@ def connect(db_path=DEFAULT_DB, *, init: bool = True) -> sqlite3.Connection:
     if path != ":memory:":
         conn.execute("PRAGMA journal_mode = WAL")     # 读写不互相阻塞
         conn.execute("PRAGMA synchronous = NORMAL")   # WAL 下够安全，且快
-    if init and (path == ":memory:" or path not in _initialized):
+    if init and (path == ":memory:" or path not in _initialized
+                 or conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION):
+        # 多读一次 `PRAGMA user_version` 才敢跳过建表：`_initialized` 只是
+        # 进程内记忆，管不了「这个文件在这期间被换掉/降级了」。一次 PRAGMA
+        # 的代价换掉一整类「库看着是新的、其实还是旧表结构」的错。
         initialize(conn)
         if path != ":memory:":
             _initialized.add(path)
@@ -69,17 +86,34 @@ def initialize(conn: sqlite3.Connection) -> int:
         conn.commit()
         return SCHEMA_VERSION
     if version < SCHEMA_VERSION:
-        # 这里故意不写「自动迁移」：写一半的迁移比不迁移更危险。
-        raise RuntimeError(
-            f"数据库 schema 版本过旧（{version} < {SCHEMA_VERSION}），"
-            f"请删库重建或手工迁移。当前文件: {_db_of(conn)}"
-        )
+        return _migrate(conn, version)
     if version > SCHEMA_VERSION:
         raise RuntimeError(
             f"数据库 schema 版本比代码新（{version} > {SCHEMA_VERSION}），"
             f"请升级 statecraft 而不是继续用旧代码写这个库"
         )
     return version
+
+
+def _migrate(conn: sqlite3.Connection, from_version: int) -> int:
+    """把旧库抬到当前版本，只允许纯新增。
+
+    唯一动作是「重跑一遍 schema.sql + 抬版本号」。之所以敢这么做，是因为
+    schema.sql 里每一条 DDL 都带 IF NOT EXISTS —— 这是可验证的，不是信仰：
+    tests/test_storage.py 里有一条用例用 v1 库跑迁移，断言老数据一条不少。
+    """
+    for v in range(from_version + 1, SCHEMA_VERSION + 1):
+        step = _ADDITIVE_STEPS.get(v)
+        if not step or not step[1]:
+            raise RuntimeError(
+                f"数据库 schema 版本过旧（{from_version} < {SCHEMA_VERSION}），"
+                f"但第 {v} 版没有登记成「纯新增」，不能自动迁移。"
+                f"请手工迁移或删库重建。当前文件: {_db_of(conn)}"
+            )
+    conn.executescript(_SCHEMA_FILE.read_text(encoding="utf-8"))
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+    return SCHEMA_VERSION
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> int:

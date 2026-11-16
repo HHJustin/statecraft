@@ -94,3 +94,26 @@ CREATE TABLE IF NOT EXISTS memory_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_history_mid ON memory_history(memory_id);
+
+-- ---------------------------------------------------------------- 增量审查缓存（v2）
+-- 一行 = 「某个函数在某个函数体哈希下的上一次审查结论」。
+--
+-- 键为什么是 (file, qualname) 而不是 (file, body_hash)：
+-- 我们只关心「这个函数现在的样子审过没有」，历史哈希没用处 —— 函数改回去
+-- 等价于重新审一次，命中旧结论反而是错的（行号可能已经变了）。所以保留
+-- 最新结论 + 一个哈希列，查询时把哈希一起比。
+--
+-- `payload` 存该函数上一次的 findings（含相对行偏移），用于全仓重跑时
+-- 直接复用结论 —— 否则「跳过」就等于「上次报的问题这次消失」，那是数据丢失
+-- 不是优化。
+CREATE TABLE IF NOT EXISTS unit_cache (
+    file       TEXT NOT NULL,
+    qualname   TEXT NOT NULL,
+    body_hash  TEXT NOT NULL,                         -- sha1(qualname + 归一化函数体)
+    review_id  TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('clean','findings','error')),
+    n_findings INTEGER NOT NULL DEFAULT 0,
+    payload    TEXT NOT NULL DEFAULT '[]',            -- JSON：可复用的 findings
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (file, qualname)
+);

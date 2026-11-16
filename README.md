@@ -68,7 +68,17 @@
   **聚合数字不经过模型**（SQL 算的，模型只负责复述会算错）；**引用回查 DB**
   （模型编的 `[F7]` 会被就地标注「查无此记录」）；**空结果不调模型**
   （没有记录直接答「没有相关结论」，成本与幻觉都是零）
-- **核心零依赖，测试全离线**（MockLLM 脚本化，221 个测试 3.2 秒跑完）
+- **增量审查（P14）**：`--diff` 只审改动过的函数。`git diff --unified=0` 解析行区间 →
+  `ast` 映射到最内层函数 → 函数体哈希一致则跳过，并**把上次的问题按新行号带回来**
+  （跳过 ≠ 结论消失，否则报告会「上次报的问题这次全没了」）。三个真机才暴露的坑：
+  未跟踪的新文件在 `git diff` 里根本不存在（静默报「没有可审的变更」）、单行函数与
+  `<module>` 区间完全重合导致同一段代码审两遍、一个任务塞 186 个函数必然 Blocked
+  → 按函数数分批（每批 ≤12 个），批内独立走完规划→审查→复核，结论累加到同一批次
+- **命令行入口（P15）**：`python -m statecraft` 五个子命令 —— `review`（增量/指定文件/整仓）、
+  `report`、`ask`、`reviews`、`units`（零成本预演「会审哪些函数」）。退出码分开：
+  0 = 正常（含「没问题」）、1 = 业务失败（Blocked）、2 = 用法或环境错误（没 key、
+  不是 git 仓库）。CI 门禁要拦「审出高危」，但不该把「没装 git」判成「审查不通过」
+- **核心零依赖，测试全离线**（MockLLM 脚本化，281 个测试 20 秒跑完）
 - **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
   连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
   3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
@@ -116,6 +126,27 @@ python examples/code-review/ask.py --db reviews.db --json --q "哪个文件问�
 # 黄金集一键跑分（L1/L2/L3 离线评估）
 python -m statecraft.eval.runner
 ```
+
+### 命令行（P15，推荐入口）
+
+`python -m statecraft` 与示例脚本共用同一份实现（示例只是薄壳）。
+
+```bash
+python -m statecraft review --path . --diff HEAD --mock   # 只审这次的改动（离线）
+python -m statecraft review --path . --diff HEAD~3 --head HEAD --three-dot  # CI 比分支
+python -m statecraft review --path src/ --severity high  # 整仓（配 --limit 控规模）
+python -m statecraft units --path . --diff HEAD          # 预演：会审哪些函数（不花钱）
+python -m statecraft review --path . --dry-run           # 同上，输出也含缓存命中情况
+
+python -m statecraft report --db reviews.db              # 最近一次报告
+python -m statecraft report --db reviews.db --review <id> --severity high
+python -m statecraft ask "auth.py 有哪些高危问题" --db reviews.db --no-llm
+python -m statecraft reviews --db reviews.db             # 列历史批次
+```
+
+`--json` 给脚本用；退出码 0/1/2 见上。**注意**：`--diff A --head B` 是在比两个提交，
+而函数是按工作区文件解析的 —— 工作区脏了行号会错位，CLI 会打一行警告，
+CI 上请先 checkout 到 B 再跑。
 
 ## 换真实 LLM
 
@@ -193,6 +224,10 @@ statecraft/
 ├── storage/       # 持久层（P12）：SQLite schema / 连接与迁移 / ReviewStore
 │                  #         DB 是真相源，FTS5 是派生索引（可一键重建）
 ├── qa/            # 问答层（P13）：规则路由 / 查询执行 / 强制引用的答案生成
+├── incremental/   # 增量审查（P14）：diff 解析 / AST 函数单位 / 函数级缓存 / 审查计划
+├── review/        # 审查流水线（P11 → P14）：领域模型 / 工具契约 / 装配 / 分批
+├── cli.py         # 命令行入口（P15）：五个子命令 + 退出码
+├── __main__.py    # python -m statecraft
 ├── providers/     # Provider 底座：工厂 + mock + openai 兼容 + 错误分类
 ├── eval/          # 黄金集评估：L1/L2/L3 跑分器 + 种子样本（JSONL）
 ├── dashboard.py   # 零依赖静态 HTML 看板
@@ -202,7 +237,9 @@ statecraft/
 
 ## 路线图后续（未实现）
 
-P14 增量审查（只审 diff）/ P15 CLI 打包 —— 见 `Statecraft完善路线图.md`；
+P14 增量审查 / P15 CLI 已完成（`--diff` + `python -m statecraft`）。仍未做：
+**pip 打包**（`pyproject.toml` 已加、console script 指向 `statecraft.cli:main`，
+但本机离线装不上 setuptools，`pip install -e .` 没实测过 —— 别当成已验证）；
 L1-Code 标注集（漏报率目前无法度量）也还缺。P13 问答已完成，但它**不是 RAG**：
 没有文档解析、没有 chunker、没有真 embedding 库、没有向量库，召回用的是
 FTS5 + LIKE + 可选的 HybridMemory（HashEmbedding 伪向量）。别把它讲成 RAG 项目。

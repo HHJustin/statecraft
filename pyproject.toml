@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statecraft"
+version = "0.1.0"
+description = "多 Agent 治理内核 + 代码注释生成 / 代码审查两条流水线"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+statecraft = "statecraft.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["statecraft*"]
+
+[tool.setuptools.package-data]
+"statecraft.storage" = ["schema.sql"]

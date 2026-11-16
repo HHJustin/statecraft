@@ -305,9 +305,58 @@ $ ask.py --db p13.db --no-llm --q "有没有处理过内存泄漏问题？"
 
 ---
 
+## 增量审查（P14）
+
+整仓重跑没人愿意用。`--diff` 只审改动过的函数：
+
+```bash
+python -m statecraft review --path . --diff HEAD --mock      # 工作区 vs HEAD
+python -m statecraft review --path . --diff HEAD~1 --head HEAD   # 两个提交之间
+python -m statecraft review --path . --diff origin/main --three-dot  # CI 比分支（merge-base）
+python -m statecraft units  --path . --diff HEAD             # 只预演范围，不调模型
+```
+
+链路：`git diff --unified=0` → 行区间 → `ast` 映射到**最内层**函数 → 函数体哈希
+（`sha1(qualname + 归一化函数体)`，忽略空行与行尾空格）→ 命中缓存就跳过。
+
+四个「看起来能用其实不能用」的坑，都踩过并修了：
+
+| 坑 | 不修会怎样 |
+|---|---|
+| `git diff` 不显示未跟踪文件 | 新建 200 行还没 `git add`，报「没有可审的变更」，不报错不提示 |
+| 一个任务审不完一整仓 | 186 个函数 → 轮次预算耗尽 → 整批 `Blocked`，连已有的正确结论一起废掉。现在按函数数分批（每批 ≤12） |
+| 清白声明只有整文件级 | 文件里报了 2 条问题，剩下 18 个函数永远「无结论」，闸门不放行。现在 `declare_clean(units=[...])` 可按函数声明 |
+| 跳过 = 结论消失 | 第二次报告会「上次报的问题这次全没了」。现在按新行号带回并标「复用」 |
+
+实测（statecraft 自己仓库，`--diff HEAD`）：15 个文件 / 196 个函数 → 19 批全 `Done`；
+第二次跑 196 个函数全部命中缓存、不调模型，仍带回 3 条结论。
+
+**`--diff A --head B` 注意**：行区间来自 B，函数却按工作区文件解析。工作区脏了会
+提示「工作区与 B 不一致，行号可能错位」—— CI 上先 checkout 到 B。
+
+---
+
+## 命令行（P15）
+
+示例脚本是薄壳，真正的入口在包里：
+
+```bash
+python -m statecraft review --path . --diff HEAD --mock --db reviews.db
+python -m statecraft report --db reviews.db [--review <id>] [--severity high]
+python -m statecraft ask "target.py 有哪些高危问题？" --db reviews.db --no-llm
+python -m statecraft reviews --db reviews.db
+python -m statecraft units --path . --diff HEAD
+```
+
+退出码：`0` 正常（含「没有问题」）/ `1` 业务失败（Blocked、查无批次）/
+`2` 用法或环境错误（没 key、不是 git 仓库、路径不存在）。
+CI 门禁靠退出码，所以要拦「审出高危」，但不该把「没装 git」判成「审查不通过」。
+
+---
+
 ## 局限（诚实清单）
 
-- **单文件、无 diff**：一次只审给定文件，不支持 git diff 增量审查。
+- ~~**无 diff**~~：P14 已解决（`--diff`，见「增量审查」一节）；不传 `--diff` 仍是整文件审。
 - **无跨文件上下文**：不知道被审函数在别处怎么被调用（符号图能力没接进来）。
 - **抽查不是全量复核**：critic 只核对 1-2 条，剩下的靠形式审兜底。
 - **行号整行匹配**：不精确到列，也不支持多行区间。

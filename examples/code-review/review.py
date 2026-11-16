@@ -16,6 +16,11 @@
     技术结论  → meta-review 抽查 + 证据核对（概率）
 详见 findings.py 顶部注释。
 
+从 P14/P15 起，真正的实现搬到了包里（`statecraft.review` / `statecraft.incremental`），
+这里只留「演示 + 标准答案对照」这两件示例专属的事：
+    - `_PLANTED` / `score_against_planted`：靶子文件的埋点答案
+    - `_ScriptedBrain`：故意编造一条证据的离线假模型（专门验证防线）
+
 运行方式：
     # 真实模型
     set OPENAI_API_KEY=...
@@ -25,11 +30,16 @@
 
     # 离线演示（无需 key，用脚本化假模型跑完整流程）
     python examples/code-review/review.py --mock
+
+    # 增量审查：只审 git 变更过的函数（P14）
+    python examples/code-review/review.py --diff HEAD~1 --mock
+
+    # 只打印会审哪些函数，不调模型（零成本预演）
+    python examples/code-review/review.py --diff HEAD~1 --dry-run
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -37,15 +47,13 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent.parent) not in sys.path:      # 允许直接 python review.py
     sys.path.insert(0, str(_HERE.parent.parent))
 
-from statecraft.config import AgentCoreConfig
-from statecraft.core.orchestrator import Orchestrator
-from statecraft.core.runner import Agent
-from statecraft.core.tools import AGENT_POLICY, ToolRegistry, default_registry
-from statecraft.memory.local import InMemoryMemory
+from statecraft.incremental import (UnitCache, plan_for_files, plan_from_diff,
+                                    plan_full, repo_root)
 from statecraft.providers.base import LLMReply, ToolCall
+from statecraft.review.findings import Finding, ReviewSession, make_tools
+from statecraft.review.pipeline import (build as _build, make_llm,
+                                        run_review)
 from statecraft.storage import DEFAULT_DB, ReviewStore
-
-from findings import ReviewSession, make_tools
 
 TARGET_DIR = _HERE
 TARGET_FILES = ["target.py"]
@@ -86,121 +94,11 @@ def score_against_planted(session: ReviewSession, planted: dict) -> dict:
             "extra": extra, "cat_ok": len(cat_ok),
             "rate": len(hit) / len(planted) if planted else None}
 
-# ---------------------------------------------------------------- 角色权限
-# 内核零改动：agents 字典的键仍是 planner/critic/executor（STATE_AGENT_MAP 约定），
-# 只把 role 换成审查流水线自己的策略名，resolve_policy 会先按 role 查。
-AGENT_POLICY["review_planner"] = {"role": "coordination",
-                                  "tools": {"report_progress", "read_file"}}
-AGENT_POLICY["reviewer"] = {"role": "execution",
-                            "tools": {"report_progress", "read_file",
-                                      "record_finding", "declare_clean"}}
-AGENT_POLICY["review_critic"] = {"role": "review",
-                                 "tools": {"report_progress", "read_file",
-                                           "confirm_finding", "review_status"}}
 
-# ---------------------------------------------------------------- 三段 prompt
-PLANNER_PROMPT = (
-    "你是代码审查规划者。用 read_file 读待审文件，然后输出一份简短审查计划：\n"
-    "逐个函数列出要检查什么（边界条件 / 异常处理 / 命名语义 / 资源泄漏 / 默认参数），"
-    "不要展开分析，不要报具体问题（报问题是审查员的工作）。\n"
-    "输出纯文本，不要写 DONE。"
-)
-
-REVIEWER_PROMPT = (
-    "你是代码审查员。严格按下面顺序工作：\n"
-    "1. 用 read_file 读文件。**没读过的文件不许报任何问题**，未读即报会被系统判定为编造。\n"
-    "2. 每发现一个真实缺陷，调用 record_finding 记录一次。要点：\n"
-    "   - evidence 必须从源文件**原样复制 1-3 行**（含代码本身），系统会逐字符核对；\n"
-    "   - message 说清「哪里不对 + 会导致什么后果」，禁止「这里可能有问题」这类空话；\n"
-    "   - 只报你确认存在的缺陷。**没有缺陷就一条都不报**，凑数编造会被形式审驳回并记录在案；\n"
-    "   - **同一行只报一个最主要的问题**。不要换措辞或换类别把同一处复述多遍，\n"
-    "     重复记录会被系统识别并丢弃。\n"
-    "3. **每个待审文件都必须有结论**：要么至少一条 record_finding，要么调用 "
-    "declare_clean 说明你检查了哪些函数、哪几类问题、为什么判定不构成缺陷。\n"
-    "   零结论的文件会被系统拦下重跑——「看完了觉得没问题」必须留下依据。\n"
-    "4. 全部处理完后，输出审查摘要，每条一行，格式：`#<id> <file>:<line> <severity> <一句话>`，"
-    "然后单独一行输出 `REQUEST_REVIEW`（硬性要求，否则流程无法推进）。"
-)
-
-CRITIC_PROMPT = (
-    "你是审查质量复核者。上下文会用 `[审核对象｜来自 X]` 标明这一轮审什么：\n"
-    "A. 来自 Planning（审计划）：只判断计划是否覆盖了全部待审文件、每个检查项是否具体。"
-    "计划阶段本来就没有具体问题清单，不要因此打回。\n"
-    "B. 来自 Executing（审报告）：**先调用 review_status 查覆盖**。"
-    "若仍有「尚无结论的文件」，直接打回要求补齐，不必看具体 finding——"
-    "漏审一个文件的报告不能算通过。覆盖齐了再抽查 1-2 条 finding，自己 read_file 核对——"
-    "证据那几行是否真的存在、问题描述是否成立。核对后用 confirm_finding 给出 "
-    "confirm 或 dispute；发现明显不符的直接 dispute。\n"
-    "输出契约（二选一，只输出一种，不要解释过程）：\n"
-    "  合格 → 只输出「审核通过」\n"
-    "  不合格 → 只输出「打回：<一句话理由>」\n"
-    "不要写 DONE。"
-)
-
-
-# ---------------------------------------------------------------- 装配
-def build(project_root: Path, llm,
-          session: ReviewSession | None = None) -> tuple[Orchestrator, ReviewSession]:
-    session = session or ReviewSession(project_root, TARGET_FILES)
-
-    registry = ToolRegistry()
-    for name in ("report_progress", "request_block"):   # 复用内核内置工具
-        registry.register(default_registry().get(name))
-    for t in make_tools(session):
-        registry.register(t)
-
-    agents = {
-        "planner": Agent("planner", llm, role="review_planner", registry=registry,
-                         system_prompt=PLANNER_PROMPT),
-        "critic": Agent("critic", llm, role="review_critic", registry=registry,
-                        system_prompt=CRITIC_PROMPT),
-        "executor": Agent("executor", llm, role="reviewer", registry=registry,
-                          system_prompt=REVIEWER_PROMPT,
-                          # 审查是「每条问题一次工具调用」的活，4 轮装不下真实文件：
-                          # 真机实测 428 行代码要报 15 条以上，4 轮必被截断。
-                          max_tool_iters=10),
-    }
-    # 规划原文是「为什么这么审」的唯一证据，但内核不保存历史产出
-    # （_last_output 只留最后一步）。这里包一层 run 把它摘出来 —— 换的是
-    # Agent 实例的属性，不是内核代码。
-    _inner_run = agents["planner"].run
-
-    async def _capture_plan(task, context_text: str = ""):
-        out = await _inner_run(task, context_text)
-        session.plan = out or ""
-        return out
-
-    agents["planner"].run = _capture_plan
-
-    def _complete(task) -> str | None:
-        """应用层完成条件：每个待审文件都要有结论（问题 或 清白声明）。
-
-        真机实测教训：审查员读完 388 行 Flask 代码一条没报，审核者也盖章通过，
-        系统就"成功"产出一份空报告。内核不知道什么叫"审完了"，所以由应用
-        把这个条件注册进去——缺文件就退回重跑，不许悄悄当 Done。
-        """
-        gap = session.unaccounted()
-        if gap:
-            return (f"以下文件还没有任何结论（既没有问题记录，也没有 declare_clean "
-                    f"清白声明）：{'、'.join(gap)}")
-        return None
-
-    orch = Orchestrator(agents, InMemoryMemory(),
-                        AgentCoreConfig(auto_confirm=True),
-                        completion_check=_complete)
-    return orch, session
-
-
-def make_llm():
-    """有 key 走真实模型，否则报错——离线请用 --mock。"""
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise SystemExit("未设置 OPENAI_API_KEY。想离线看流程请加 --mock。")
-    from statecraft.providers.openai_compat import OpenAICompatLLM
-    base = os.environ.get("OPENAI_BASE_URL", "https://www.apigoto.com/v1")
-    model = os.environ.get("OPENAI_MODEL", "deepseek-flash")
-    print(f"[review] 模型: {model} @ {base}")
-    return OpenAICompatLLM(base_url=base, model=model, api_key=key)
+def build(project_root: Path, llm, session: ReviewSession | None = None,
+          plan=None):
+    """兼容旧签名：示例与测试都用 `R.build(root, brain, session)`。"""
+    return _build(project_root, llm, session, plan)
 
 
 # ---------------------------------------------------------------- 离线假模型
@@ -306,55 +204,69 @@ class _ScriptedBrain:
 
 
 # ---------------------------------------------------------------- 主流程
+def _plan(root: Path, files: list[str], diff: str | None, head: str | None,
+          three_dot: bool, everything: bool, cache):
+    if diff is not None:
+        base = repo_root(root)
+        print(f"[review] git 根目录 {base}（--root 指向子目录时自动对齐）")
+        return plan_from_diff(base, base=diff, head=head, three_dot=three_dot,
+                              cache=cache)
+    if everything:
+        return plan_full(root, cache=cache)
+    return plan_for_files(root, files, cache=cache)
+
+
 async def main(mock: bool = False, files: list[str] | None = None,
                root: str | Path | None = None, db: str | None = None,
-               review_id: str | None = None) -> None:
+               review_id: str | None = None, diff: str | None = None,
+               head: str | None = None, three_dot: bool = False,
+               everything: bool = False, dry_run: bool = False,
+               no_cache: bool = False) -> None:
     files = files or TARGET_FILES
     root = Path(root).resolve() if root else TARGET_DIR
-    session = ReviewSession(root, files)
+    if db != "":
+        db_path = db or str(DEFAULT_DB_PATH)
+    else:
+        db_path = None
+
+    cache, pre = None, None
+    if db_path and not no_cache:
+        pre = ReviewStore(db_path)
+        cache = UnitCache(pre)
+    try:
+        plan = _plan(root, files, diff, head, three_dot, everything, cache)
+    finally:
+        if pre is not None:
+            pre.close()
+
+    print("[review] 审查范围:")
+    for line in plan.summary_lines():
+        print("   ", line)
+    if dry_run:
+        print("\n" + plan.describe_verbose())
+        print(f"\n[dry-run] 预计审查 {plan.unit_count} 个函数 / {len(plan.files)} 个文件，"
+              f"未调用模型。")
+        return
+
     if mock:
         print("[review] 离线模式：脚本化假模型（--mock）")
-        llm = _ScriptedBrain(session)
+        brain_holder: dict = {}
+
+        def factory(session):
+            brain_holder["b"] = _ScriptedBrain(session)
+            return brain_holder["b"]
+
+        outcome = await run_review(plan, None, db=db_path, review_id=review_id,
+                                   llm_factory=factory, model_name="mock")
     else:
         llm = make_llm()
+        import os
+        print(f"[review] 模型: {os.environ.get('OPENAI_MODEL', '')} @ "
+              f"{os.environ.get('OPENAI_BASE_URL', '')}")
+        outcome = await run_review(plan, llm, db=db_path, review_id=review_id,
+                                   model_name=os.environ.get("OPENAI_MODEL", ""))
 
-    orch, session = build(root, llm, session)
-
-    print("[review] 待审文件:", ", ".join(files))
-    task = orch.create_task(
-        f"对代码文件 {', '.join(files)} 做代码审查，输出结构化问题清单。\n"
-        f"[要求] 每条问题必须带文件、行号、严重度、类别与源文件证据；"
-        f"证据需逐字符可核对。只报真实缺陷。"
-    )
-    # ---- P12：结果落库（db="" 表示本次不落库）----
-    store, pinned = None, review_id      # pinned：调用方指定的批次号，None = 新建
-    review_id = None
-    if db != "":
-        store = ReviewStore(db or DEFAULT_DB_PATH)
-        review_id = store.start_review(
-            repo_root=root, scope=files, task_id=task.id, review_id=pinned,
-            model="mock" if mock else os.environ.get("OPENAI_MODEL", ""))
-        session.attach(store, review_id)      # 之后每条结论都自动落库
-        print(f"[review] 持久化: {db or DEFAULT_DB_PATH}｜批次 {review_id}")
-
-    try:
-        result = await orch.run(task)
-    except Exception as exc:                    # noqa: BLE001
-        # 任何异常都不能让批次停在 draft —— 库里躺着一个「正在跑」的审查，
-        # 比明确失败更糟：第二天没人知道它是死是活。
-        if store is not None:
-            store.finish_review(review_id, "blocked", plan=session.plan or None)
-            print(f"\n[review] 运行中断：{type(exc).__name__}: {exc}")
-            print(f"[review] 已按 blocked 落库：批次 {review_id}｜"
-                  f"保留 findings {len(session.findings)} 条")
-        raise
-
-    if store is not None:
-        # Done 与 Blocked 都落终态：Blocked 的 findings 恰恰是最该留档的
-        store.finish_review(review_id,
-                            "done" if result.state == "Done" else "blocked",
-                            plan=session.plan or None)
-
+    session, result = outcome.session, outcome
     print("\n" + "=" * 72)
     print("[review] 最终状态:", result.state)
     print("[review] 流转轨迹:",
@@ -381,8 +293,13 @@ async def main(mock: bool = False, files: list[str] | None = None,
           f"  有效: {ok}  编造驳回: {rej}  复核推翻: {dis}")
     print(f"  幻觉率(编造): {rej / total:.0%}"
           f"  复核推翻率: {dis / max(1, ok + dis):.0%}")
+    if plan.skipped:
+        print(f"  增量: 缓存跳过 {len(plan.skipped)} 个函数（函数体哈希未变）"
+              f"｜复用结论 {outcome.adopted} 条")
+    if not outcome.ran_model:
+        print("  本次全部命中缓存，未调用模型。")
 
-    planted = planted_for(files)
+    planted = planted_for(session.files) if plan.source == "files" else {}
     if planted:
         sc = score_against_planted(session, planted)
         print(f"  埋点检出: {sc['hit']}/{sc['expected']}（{sc['rate']:.0%}）"
@@ -393,40 +310,53 @@ async def main(mock: bool = False, files: list[str] | None = None,
             print(f"  额外发现 {len(sc['extra'])} 条（标准答案之外，需人工复核）:")
             for f in sc["extra"]:
                 print(f"    · {f.file}:{f.line} {f.severity} {f.message[:52]}")
-    else:
+    elif plan.source == "files":
         print(f"  无标准答案文件：报了 {ok} 条（需人工复核，不能直接算误报）")
 
-    if store is not None:
-        rv = store.get_review(review_id)
-        print("\n[review] 已落库（P12）：")
-        print(f"  批次 {review_id}｜状态 {rv['status']}｜"
-              f"findings {rv['findings_total']} 条（确认 {rv['findings_confirmed']}"
-              f" / 推翻 {rv['findings_disputed']}）")
-        print("  严重度分布:", store.counts_by_severity(review_id))
-        dist = ", ".join(f"{r['file']}×{r['n']}" for r in store.counts_by_file(review_id))
-        print("  文件分布:", dist or "（无）")
-        hits = store.search("average", limit=3)
-        sample = (f"，例 {hits[0]['file']}:{hits[0]['line']}"
-                  f" {hits[0]['message'][:34]}" if hits else "")
-        print(f"  符号检索 'average' → {len(hits)} 条{sample}")
-        print("  清白声明:", [c["file"] for c in store.clean_claims(review_id)] or "（无）")
-        print(f"  历史批次: {len(store.list_reviews())} 条")
-        store.close()
+    if db_path:
+        rv = ReviewStore(db_path)
+        try:
+            r = rv.get_review(outcome.review_id)
+            print("\n[review] 已落库（P12）：")
+            print(f"  批次 {outcome.review_id}｜状态 {r['status']}｜"
+                  f"findings {r['findings_total']} 条（确认 {r['findings_confirmed']}"
+                  f" / 推翻 {r['findings_disputed']}）")
+            print("  严重度分布:", rv.counts_by_severity(outcome.review_id))
+            dist = ", ".join(f"{x['file']}×{x['n']}"
+                             for x in rv.counts_by_file(outcome.review_id))
+            print("  文件分布:", dist or "（无）")
+            print("  清白声明:", [c["file"] for c in rv.clean_claims(outcome.review_id)]
+                  or "（无）")
+            print(f"  历史批次: {len(rv.list_reviews())} 条")
+        finally:
+            rv.close()
     print("=" * 72)
 
 
 if __name__ == "__main__":
+    argv = sys.argv[1:]
     _files, _root, _db, _rid = [], None, None, None
-    if "--no-db" in sys.argv:
+    _diff, _head = None, None
+    if "--no-db" in argv:
         _db = ""                                  # 显式关掉落库
-    for i, a in enumerate(sys.argv):
-        if a == "--file" and i + 1 < len(sys.argv):
-            _files.extend(sys.argv[i + 1].split(","))
-        if a == "--root" and i + 1 < len(sys.argv):
-            _root = sys.argv[i + 1]
-        if a == "--db" and i + 1 < len(sys.argv):
-            _db = sys.argv[i + 1]
-        if a == "--review-id" and i + 1 < len(sys.argv):
-            _rid = sys.argv[i + 1]      # 固定批次号 = 重跑覆盖而非新增
-    asyncio.run(main(mock="--mock" in sys.argv, files=_files or None,
-                     root=_root, db=_db, review_id=_rid))
+    for i, a in enumerate(argv):
+        def _val(j=i):
+            return argv[j + 1] if j + 1 < len(argv) else None
+        if a == "--file" and i + 1 < len(argv):
+            _files.extend(_val().split(","))
+        elif a == "--root" and i + 1 < len(argv):
+            _root = _val()
+        elif a == "--db" and i + 1 < len(argv):
+            _db = _val()
+        elif a == "--review-id" and i + 1 < len(argv):
+            _rid = _val()                          # 固定批次号 = 重跑覆盖而非新增
+        elif a == "--head" and i + 1 < len(argv):
+            _head = _val()
+    if "--diff" in argv:                           # --diff 或 --diff <rev>
+        i = argv.index("--diff")
+        nxt = argv[i + 1] if i + 1 < len(argv) else ""
+        _diff = nxt if nxt and not nxt.startswith("--") else "HEAD"
+    asyncio.run(main(mock="--mock" in argv, files=_files or None, root=_root,
+                     db=_db, review_id=_rid, diff=_diff, head=_head,
+                     three_dot="--three-dot" in argv, everything="--all" in argv,
+                     dry_run="--dry-run" in argv, no_cache="--no-cache" in argv))
