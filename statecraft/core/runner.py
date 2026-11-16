@@ -13,16 +13,34 @@ from .tools import (ToolRegistry, call_tool, default_registry,
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "agents"
 
 
+class PromptResourceMissing(RuntimeError):
+    """包内 agents/ 缺文件 —— 这是打包问题，不是运行时问题。"""
+
+
 def load_prompt(name: str, prompts_dir: Path | None = None) -> str:
-    """三层 prompt 继承（源自 Edict）：GLOBAL.md → {name}.md。"""
+    """三层 prompt 继承（源自 Edict）：GLOBAL.md → {name}.md。
+
+    默认目录是**包内** `statecraft/agents/`，这些 md 靠 pyproject 的
+    `package-data` 带进 wheel。缺文件时不许静默降级：原来的写法返回
+    「你是 executor。」，装出来的包照样跑、测试照样全绿，但多 agent 的
+    全部行为约束凭空消失 —— 没有异常、没有日志，只有输出质量整体掉档。
+    """
     base = Path(prompts_dir) if prompts_dir else _PROMPTS_DIR
     parts: list[str] = []
     g = base / "GLOBAL.md"
     if g.exists():
         parts.append(g.read_text(encoding="utf-8"))
     r = base / f"{name}.md"
-    if r.exists():
+    # name="GLOBAL" 时 r 就是 g：再拼一次等于把规范读两遍（长度翻倍，
+    # 而且模型看到两份一模一样的规则）。实际调用不会传 GLOBAL，但没理由留坑。
+    if r.exists() and r.resolve() != g.resolve():
         parts.append(r.read_text(encoding="utf-8"))
+    if prompts_dir is None:
+        missing = [x.name for x in (g, r) if not x.exists()]
+        if missing:
+            raise PromptResourceMissing(
+                f"包内 agents 目录缺 {missing}（{base}）。多半是 wheel 漏了 "
+                f"package-data —— 检查 pyproject 的 [tool.setuptools.package-data]。")
     return "\n\n".join(parts) or f"你是 {name}。"
 
 

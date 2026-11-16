@@ -78,7 +78,7 @@
   `report`、`ask`、`reviews`、`units`（零成本预演「会审哪些函数」）。退出码分开：
   0 = 正常（含「没问题」）、1 = 业务失败（Blocked）、2 = 用法或环境错误（没 key、
   不是 git 仓库）。CI 门禁要拦「审出高危」，但不该把「没装 git」判成「审查不通过」
-- **核心零依赖，测试全离线**（MockLLM 脚本化，281 个测试 20 秒跑完）
+- **核心零依赖，测试全离线**（MockLLM 脚本化，292 个测试 23 秒跑完）
 - **真实模型已验证**（DeepSeek V3 2026-11-11 / DeepSeek flash 2026-11-13）：
   连通 / 工具循环 / 端到端三链路通过；真模型下 critic 主动打回、Saga 逆序回滚
   3 个文件编辑、审产出靠 `read_file` 抓到「docstring 与实现不符」的真实缺陷。
@@ -147,6 +147,24 @@ python -m statecraft reviews --db reviews.db             # 列历史批次
 `--json` 给脚本用；退出码 0/1/2 见上。**注意**：`--diff A --head B` 是在比两个提交，
 而函数是按工作区文件解析的 —— 工作区脏了行号会错位，CLI 会打一行警告，
 CI 上请先 checkout 到 B 再跑。
+
+### 安装（P15）
+
+```bash
+pip install -e .          # 开发用：改代码立刻生效
+pip install .             # 正常安装：生成 wheel 再装
+statecraft --help         # 在任何目录都能用
+```
+
+打包里踩到的两个坑，都不是「配置写好看点」能糊过去的：
+
+| 坑 | 不修的后果 |
+|---|---|
+| `agents/*.md`、`schema.sql`、`eval/golden/*.jsonl` 没写进 `package-data` | 装出来的包**少了这些文件**，而且 `load_prompt()` 会静默降级成「你是 executor。」—— 程序照跑、测试全绿，多 agent 的约束全没了。现在缺文件直接抛 `PromptResourceMissing`，并有用例盯着 `package-data` 的三个键 |
+| `license = {text = "MIT"}` | setuptools>=77 已弃用 TOML 表写法，2027-02 之后直接构建失败。改成 SPDX 字符串 + `license-files` |
+
+回归用例在 `tests/test_packaging.py`（11 例）：资源在不在、能不能真建库、
+黄金集能不能加载、`pyproject` 有没有声明、console script 指向的函数存不存在。
 
 ## 换真实 LLM
 
@@ -238,8 +256,8 @@ statecraft/
 ## 路线图后续（未实现）
 
 P14 增量审查 / P15 CLI 已完成（`--diff` + `python -m statecraft`）。仍未做：
-**pip 打包**（`pyproject.toml` 已加、console script 指向 `statecraft.cli:main`，
-但本机离线装不上 setuptools，`pip install -e .` 没实测过 —— 别当成已验证）；
+~~pip 打包~~ **已验证**：`pip install -e .` 与 `pip install .` 都实测通过，
+`statecraft` 命令在项目目录外可用（详见下方「安装」）；
 L1-Code 标注集（漏报率目前无法度量）也还缺。P13 问答已完成，但它**不是 RAG**：
 没有文档解析、没有 chunker、没有真 embedding 库、没有向量库，召回用的是
 FTS5 + LIKE + 可选的 HybridMemory（HashEmbedding 伪向量）。别把它讲成 RAG 项目。
